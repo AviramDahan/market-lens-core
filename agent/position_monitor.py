@@ -1,0 +1,1177 @@
+from __future__ import annotations
+
+import json
+import math
+import os
+import sys
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+from openpyxl import load_workbook
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.execution import EXECUTION_VERSION, position_metadata, sell_fill
+from app.data import fetch_intraday_frame
+from app.position_market_data import validated_position_frame
+from app.trading_clock import NY_TZ, session_bounds
+from app.telegram_notifications import (
+    build_telegram_dedupe_key,
+    dashboard_url_from_env,
+    format_position_event_message,
+    format_stop_moved_to_entry_message,
+    send_telegram_message,
+    send_telegram_notification,
+)
+from app.workbook_retention import compact_setup_watchlist, save_workbook_atomically
+
+
+DEFAULT_TRACKER = ROOT / "agent_tracker" / "market_lens_agent_portfolio_budget_100k.xlsx"
+DEFAULT_RUN_DIR = ROOT / "agent_results"
+EVENT_SHEET = "Position Events"
+
+
+@dataclass
+class MonitorSettings:
+    excel_path: Path
+    run_dir: Path
+    period: str
+    interval: str
+    save_noop: bool
+    dashboard_url: str
+    extended_hours_targets: bool = True
+    extended_hours_stops: bool = False
+    extended_hours_target_confirmation_bars: int = 2
+
+
+@dataclass
+class PositionEvent:
+    ticker: str
+    action: str
+    triggered_at: str
+    trigger_price: float
+    high: float
+    low: float
+    close: float
+    quantity: int
+    cash_in: float
+    note: str
+    trade_id: str = ""
+    execution_details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class MonitorResult:
+    ticker: str
+    status: str
+    current_price: float
+    event: PositionEvent | None = None
+    error: str = ""
+
+
+def main() -> None:
+    settings = load_settings()
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    clear_notification_outbox()
+
+    wb = load_workbook(settings.excel_path)
+    ensure_agent_columns(wb)
+    ensure_position_events_sheet(wb)
+
+    settings_values = read_settings(wb)
+    currency = str(settings_values.get("budget_currency") or "USD").upper()
+    currency_rate = 1.0 if currency == "USD" else float(settings_values.get("usd_ils_rate", 3.7))
+    starting_capital = float(
+        settings_values.get("starting_capital_usd")
+        or settings_values.get("starting_capital_ils")
+        or 100_000
+    )
+
+    open_positions = read_open_positions(wb)
+    last_event_times = read_last_event_times(wb, open_positions)
+    results: list[MonitorResult] = []
+    event_notifications: list[tuple[dict[str, Any], PositionEvent]] = []
+
+    for ticker, position in list(open_positions.items()):
+        since = last_event_times.get(ticker)
+        position_results, notifications = process_position_window(
+            wb, open_positions, position, settings=settings, since=since,
+            currency_rate=currency_rate, timestamp=timestamp, run_id=run_id,
+        )
+        results.extend(position_results)
+        event_notifications.extend(notifications)
+
+    health = classify_monitor_results(results)
+    print(json.dumps(health, sort_keys=True))
+    if health["status"] == "MONITOR_FAILED":
+        # Nothing was evaluated successfully; do not persist a healthy-looking run.
+        wb.close()
+        raise SystemExit(1)
+    if health["status"] == "MONITOR_DEGRADED":
+        print("::warning::Some positions could not be evaluated; valid events will still be saved.")
+    events = [result.event for result in results if result.event]
+    errors = [f"{result.ticker}: {result.error}" for result in results if result.error]
+    write_monitor_heartbeat(
+        settings,
+        run_id=run_id,
+        timestamp=timestamp,
+        health=health,
+        event_count=len(events),
+    )
+    should_save = bool(events) or settings.save_noop
+
+    summary_path = None
+    if should_save:
+        if events:
+            for result in results:
+                if not result.event and result.current_price > 0 and result.ticker in open_positions:
+                    refresh_position(open_positions[result.ticker], result.current_price, currency_rate)
+        write_open_positions(wb, open_positions)
+        cash = compute_cash(wb, starting_capital)
+        exposure = sum(float(pos.get("exposure_ils") or 0) for pos in open_positions.values())
+        open_risk = sum(float(pos.get("risk_ils") or 0) for pos in open_positions.values())
+        summary_path = write_summary(
+            settings=settings,
+            run_id=run_id,
+            timestamp=timestamp,
+            results=results,
+            cash=cash,
+            exposure=exposure,
+            open_risk=open_risk,
+            currency=currency,
+        )
+        append_update_log(
+            wb,
+            timestamp=timestamp,
+            run_id=f"monitor_{run_id}",
+            tickers=list(open_positions.keys()) or [result.ticker for result in results],
+            actions=events,
+            cash=cash,
+            exposure=exposure,
+            open_risk=open_risk,
+            open_positions=len(open_positions),
+            summary_path=summary_path,
+        )
+        retention = compact_setup_watchlist(wb)
+        if retention["rows_removed"]:
+            print(
+                "Compacted Setup Watchlist: "
+                f"removed {retention['rows_removed']} old rows; "
+                f"kept {retention['rows_after']}."
+            )
+        save_workbook_atomically(wb, settings.excel_path)
+        if events:
+            if notification_outbox_path() is not None:
+                outbox = write_notification_outbox(
+                    event_notifications,
+                    settings=settings,
+                    run_id=run_id,
+                    timestamp=timestamp,
+                )
+                print(f"Notification outbox: {outbox}")
+            else:
+                send_position_event_notifications(
+                    event_notifications,
+                    settings=settings,
+                    run_id=run_id,
+                    timestamp=timestamp,
+                )
+
+    if events:
+        print(f"Position monitor completed with {len(events)} event(s).")
+    elif errors:
+        print(f"Position monitor completed with no portfolio events and {len(errors)} data issue(s).")
+    else:
+        print("Position monitor completed with no portfolio events.")
+    if summary_path:
+        print(f"Summary: {summary_path}")
+
+
+def classify_monitor_results(results: list[MonitorResult]) -> dict[str, Any]:
+    failures = [result for result in results if result.error or result.status in {"ERROR", "DATA_ERROR", "NO_DATA"}]
+    return {
+        "status": ("MONITOR_FAILED" if results and len(failures) == len(results)
+                   else "MONITOR_DEGRADED" if failures else "MONITOR_OK"),
+        "positions_checked": len({result.ticker for result in results}),
+        "positions_failed": len({result.ticker for result in failures}),
+        "failed_positions": [{"ticker": result.ticker, "status": result.status} for result in failures],
+    }
+
+
+def load_settings() -> MonitorSettings:
+    load_dotenv(ROOT / ".env")
+    return MonitorSettings(
+        excel_path=Path(os.getenv("MARKET_LENS_EXCEL_PATH", DEFAULT_TRACKER)),
+        run_dir=Path(os.getenv("MARKET_LENS_RUN_DIR", DEFAULT_RUN_DIR)),
+        period=os.getenv("MARKET_LENS_MONITOR_PERIOD", "5d"),
+        interval=os.getenv("MARKET_LENS_MONITOR_INTERVAL", "1m"),
+        save_noop=os.getenv("MARKET_LENS_MONITOR_SAVE_NOOP", "false").lower() in {"1", "true", "yes"},
+        dashboard_url=dashboard_url_from_env(os.getenv("MARKET_LENS_URL", "")),
+        extended_hours_targets=env_bool("MARKET_LENS_MONITOR_EXTENDED_HOURS_TARGETS", True),
+        extended_hours_stops=env_bool("MARKET_LENS_MONITOR_EXTENDED_HOURS_STOPS", False),
+        extended_hours_target_confirmation_bars=max(
+            1, min(5, int(os.getenv("MARKET_LENS_MONITOR_EXTENDED_HOURS_TARGET_CONFIRMATION_BARS", "2")))
+        ),
+    )
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def notification_outbox_path() -> Path | None:
+    raw_path = os.getenv("MARKET_LENS_MONITOR_NOTIFICATION_OUTBOX", "").strip()
+    return Path(raw_path) if raw_path else None
+
+
+def clear_notification_outbox() -> None:
+    path = notification_outbox_path()
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"Could not clear stale monitor notification outbox: {path}") from exc
+
+
+def write_notification_outbox(
+    event_notifications: list[tuple[dict[str, Any], PositionEvent]],
+    *,
+    settings: MonitorSettings,
+    run_id: str,
+    timestamp: str,
+) -> Path:
+    path = notification_outbox_path()
+    if path is None:
+        raise RuntimeError("Monitor notification outbox path is not configured.")
+    payload = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "dashboard_url": settings.dashboard_url,
+        "events": [
+            {"position": json_safe(position), "event": asdict(event)}
+            for position, event in event_notifications
+        ],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
+def write_monitor_heartbeat(
+    settings: MonitorSettings,
+    *,
+    run_id: str,
+    timestamp: str,
+    health: dict[str, Any],
+    event_count: int,
+) -> Path:
+    path = Path(
+        os.getenv("MARKET_LENS_MONITOR_HEARTBEAT_PATH")
+        or settings.run_dir / "position_monitor" / "latest_status.json"
+    )
+    payload = {
+        "schema_version": 1,
+        "timestamp": timestamp,
+        "run_id": f"monitor_{run_id}",
+        "status": health.get("status", ""),
+        "positions_checked": int(health.get("positions_checked") or 0),
+        "positions_failed": int(health.get("positions_failed") or 0),
+        "failed_positions": health.get("failed_positions") or [],
+        "event_count": int(event_count),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
+def send_notification_outbox(path: Path) -> list[Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != 1 or not isinstance(payload.get("events"), list):
+        raise ValueError("Unsupported monitor notification outbox schema.")
+    settings = MonitorSettings(
+        excel_path=Path("."),
+        run_dir=Path("."),
+        period="",
+        interval="",
+        save_noop=False,
+        dashboard_url=str(payload.get("dashboard_url") or ""),
+    )
+    notifications = []
+    for item in payload["events"]:
+        position = item.get("position")
+        event_payload = item.get("event")
+        if not isinstance(position, dict) or not isinstance(event_payload, dict):
+            raise ValueError("Malformed monitor notification outbox event.")
+        notifications.append((position, PositionEvent(**event_payload)))
+    return send_position_event_notifications(
+        notifications,
+        settings=settings,
+        run_id=str(payload.get("run_id") or ""),
+        timestamp=str(payload.get("timestamp") or ""),
+    )
+
+
+def json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return str(value)
+
+
+def send_position_event_notifications(
+    event_notifications: list[tuple[dict[str, Any], PositionEvent]],
+    *,
+    settings: MonitorSettings,
+    run_id: str,
+    timestamp: str,
+) -> list[Any]:
+    outcomes = []
+    for position, event in event_notifications:
+        message = format_position_event_message(
+            position=position,
+            event=event,
+            run_id=run_id,
+            timestamp=timestamp,
+            dashboard_url=settings.dashboard_url,
+        )
+        dedupe_key = position_event_dedupe_key(position, event)
+        outcome = send_telegram_notification(
+            message,
+            chart_ref=position.get("chart_url"),
+            ticker=event.ticker,
+            dashboard_url=settings.dashboard_url,
+            dedupe_key=dedupe_key,
+        )
+        outcomes.append(outcome)
+        if outcome.sent:
+            print(f"Telegram position-event notification sent for {event.ticker}:{event.action}.")
+        elif outcome.status == "duplicate":
+            print(f"Telegram position-event duplicate skipped for {event.ticker}:{event.action}.")
+        elif outcome.status != "not_configured":
+            print(f"Telegram position-event notification skipped for {event.ticker}:{event.action}: {outcome.reason}")
+        if should_notify_stop_moved_to_entry(position, event):
+            stop_message = format_stop_moved_to_entry_message(
+                position=position,
+                event=event,
+                run_id=run_id,
+                timestamp=timestamp,
+                dashboard_url=settings.dashboard_url,
+            )
+            stop_outcome = send_telegram_message(
+                stop_message,
+                dedupe_key=build_telegram_dedupe_key(dedupe_key, "STOP_TO_ENTRY"),
+            )
+            outcomes.append(stop_outcome)
+            if stop_outcome.sent:
+                print(f"Telegram stop-to-entry notification sent for {event.ticker}.")
+            elif stop_outcome.status == "duplicate":
+                print(f"Telegram stop-to-entry duplicate skipped for {event.ticker}.")
+            elif stop_outcome.status != "not_configured":
+                print(f"Telegram stop-to-entry notification skipped for {event.ticker}: {stop_outcome.reason}")
+    return outcomes
+
+
+def position_event_dedupe_key(position: dict[str, Any], event: PositionEvent) -> str:
+    decision = parse_decision_json(position.get("decision_json"))
+    position_identity = decision.get("trade_id") or build_telegram_dedupe_key(
+        position.get("entry_date"),
+        position.get("entry_price"),
+        position.get("quantity"),
+        position.get("stop_loss"),
+        position.get("target_1"),
+        position.get("target_2"),
+    )
+    return build_telegram_dedupe_key(
+        "POSITION_EVENT",
+        event.ticker,
+        event.action,
+        position_identity,
+        event.trigger_price,
+    )
+
+
+def should_notify_stop_moved_to_entry(position: dict[str, Any], event: PositionEvent) -> bool:
+    if event.action != "TAKE_PARTIAL_PROFIT":
+        return False
+    entry = float(position.get("entry_price") or 0)
+    previous_stop = float(position.get("stop_loss") or 0)
+    total_quantity = int(position.get("quantity") or 0)
+    remaining_quantity = total_quantity - int(event.quantity or 0)
+    return entry > 0 and remaining_quantity > 0 and previous_stop < entry - 0.005
+
+
+def process_position_window(
+    wb: Any, open_positions: dict[str, dict[str, Any]], position: dict[str, Any],
+    *, settings: MonitorSettings, since: datetime | None, currency_rate: float,
+    timestamp: str, run_id: str,
+) -> tuple[list[MonitorResult], list[tuple[dict[str, Any], PositionEvent]]]:
+    results = []
+    notifications = []
+    frame_cache: dict[str, Any] = {}
+    # At most one partial and one terminal exit; a final pass may refresh a hold.
+    for _ in range(3):
+        result = monitor_position(position, settings=settings, since=since,
+                                  currency_rate=currency_rate, frame_cache=frame_cache,
+                                  as_of=parse_timestamp(timestamp))
+        if not result.event:
+            if not results or result.error or result.status in {"ERROR", "DATA_ERROR", "NO_DATA"}:
+                results.append(result)
+            if result.current_price > 0 and (settings.save_noop or notifications):
+                refresh_position(position, result.current_price, currency_rate)
+            return results, notifications
+        results.append(result)
+        notifications.append((dict(position), result.event))
+        apply_event(wb, open_positions, position, result.event, timestamp, run_id, currency_rate)
+        if result.ticker not in open_positions:
+            return results, notifications
+        since = parse_timestamp(result.event.triggered_at)
+    raise RuntimeError("Position monitor exceeded bounded lifecycle event count")
+
+
+def monitor_position(
+    position: dict[str, Any],
+    *,
+    settings: MonitorSettings,
+    since: datetime | None,
+    currency_rate: float,
+    frame_cache: dict[str, Any] | None = None,
+    as_of: datetime | None = None,
+) -> MonitorResult:
+    ticker = str(position.get("ticker") or "").upper()
+    entry_time = parse_timestamp(position.get("entry_date"))
+    if entry_time is None:
+        return MonitorResult(ticker=ticker, status="DATA_ERROR", current_price=0.0,
+                             error="Entry timestamp missing; cannot safely replay price events.")
+    try:
+        if frame_cache is not None and ticker in frame_cache:
+            frame = frame_cache[ticker]
+        else:
+            include_prepost = settings.extended_hours_targets or settings.extended_hours_stops
+            frame = fetch_intraday_frame(
+                ticker,
+                period=settings.period,
+                interval=settings.interval,
+                include_prepost=include_prepost,
+            )
+            if frame_cache is not None:
+                frame_cache[ticker] = frame
+    except Exception as exc:
+        return MonitorResult(ticker=ticker, status="DATA_ERROR", current_price=0.0, error=str(exc))
+
+    if frame.empty:
+        return MonitorResult(ticker=ticker, status="NO_DATA", current_price=0.0)
+
+    if as_of is not None:
+        try:
+            frame = validated_position_frame(frame, interval=settings.interval, now=as_of)
+        except (KeyError, TypeError, ValueError) as exc:
+            return MonitorResult(ticker=ticker, status="DATA_ERROR", current_price=0.0, error=str(exc))
+
+    try:
+        prices = frame[["High", "Low", "Close"]].astype(float)
+        if (not all(math.isfinite(value) and value > 0 for value in prices.to_numpy().flat)
+                or (prices["Low"] > prices["High"]).any()
+                or (prices["Close"] < prices["Low"]).any()
+                or (prices["Close"] > prices["High"]).any()):
+            raise ValueError("Invalid price range")
+    except (KeyError, TypeError, ValueError):
+        return MonitorResult(ticker=ticker, status="DATA_ERROR", current_price=0.0,
+                             error="Price bars require finite positive High/Low/Close and consistent ranges.")
+    latest_close = float(prices["Close"].iloc[-1])
+    if not frame.index.is_monotonic_increasing or not frame.index.is_unique or frame.index.tz is None:
+        return MonitorResult(ticker=ticker, status="DATA_ERROR", current_price=0.0,
+                             error="Price bars require ordered, unique, timezone-aware timestamps.")
+    # Exclude bars which began before entry, including the ambiguous entry minute.
+    bars = frame[frame.index >= entry_time]
+    if since and ensure_utc(since) >= entry_time:
+        cutoff = ensure_utc(since)
+        bars = bars[bars.index > cutoff]
+    if bars.empty:
+        return MonitorResult(ticker=ticker, status="NO_NEW_BARS", current_price=latest_close)
+
+    stop = float(position.get("stop_loss") or 0)
+    target_1 = float(position.get("target_1") or 0)
+    target_2 = float(position.get("target_2") or 0)
+    partial_taken = bool(position.get("partial_taken"))
+    quantity = int(position.get("quantity") or 0)
+    for offset, (index, row) in enumerate(bars.iterrows()):
+        high = float(row["High"])
+        low = float(row["Low"])
+        close = float(row["Close"])
+        regular_session = is_regular_session_bar(index)
+        stops_allowed = regular_session or settings.extended_hours_stops
+        hit_stop = stops_allowed and stop > 0 and low <= stop
+        hit_target_2 = target_2 > 0 and (
+            (regular_session and high >= target_2)
+            or (
+                not regular_session
+                and settings.extended_hours_targets
+                and extended_hours_target_confirmed(
+                    bars, offset, target_2, settings.extended_hours_target_confirmation_bars
+                )
+            )
+        )
+        hit_target_1 = target_1 > 0 and not partial_taken and (
+            (regular_session and high >= target_1)
+            or (
+                not regular_session
+                and settings.extended_hours_targets
+                and extended_hours_target_confirmed(
+                    bars, offset, target_1, settings.extended_hours_target_confirmation_bars
+                )
+            )
+        )
+        session_note = "" if regular_session else " Extended-hours bar policy applied."
+
+        if hit_stop or hit_target_2 or hit_target_1:
+            # The event bar is the finest available resolution; never include later bars.
+            update_position_excursion(position, bars.iloc[:offset + 1])
+
+        if hit_stop:
+            note = "Stop loss touched by intraday low."
+            if hit_target_1 or hit_target_2:
+                note += " Same candle also touched a target; conservative stop-first policy applied."
+            event = build_event(
+                position,
+                action="EXIT_STOP",
+                triggered_at=index.isoformat(),
+                trigger_price=stop,
+                observed_price=(float(row["Open"]) if position_metadata(position).get("execution_model_version") == EXECUTION_VERSION else None),
+                high=high,
+                low=low,
+                close=close,
+                quantity=quantity,
+                currency_rate=currency_rate,
+                note=note + session_note,
+            )
+            return MonitorResult(ticker=ticker, status="EVENT", current_price=close, event=event)
+
+        if hit_target_2:
+            target_note = (
+                "Target 2 touched by intraday high; closing remaining simulated position."
+                if regular_session
+                else (
+                    "Target 2 confirmed by "
+                    f"{settings.extended_hours_target_confirmation_bars} consecutive completed "
+                    "extended-hours minute closes; closing remaining simulated position."
+                )
+            )
+            event = build_event(
+                position,
+                action="TAKE_PROFIT",
+                triggered_at=index.isoformat(),
+                trigger_price=target_2,
+                high=high,
+                low=low,
+                close=close,
+                quantity=quantity,
+                currency_rate=currency_rate,
+                note=target_note,
+            )
+            return MonitorResult(ticker=ticker, status="EVENT", current_price=close, event=event)
+
+        if hit_target_1:
+            closed_qty = max(1, quantity // 2)
+            target_note = (
+                "Target 1 touched by intraday high; taking partial profit and moving stop to breakeven."
+                if regular_session
+                else (
+                    "Target 1 confirmed by "
+                    f"{settings.extended_hours_target_confirmation_bars} consecutive completed "
+                    "extended-hours minute closes; taking partial profit and moving stop to breakeven."
+                )
+            )
+            event = build_event(
+                position,
+                action="TAKE_PARTIAL_PROFIT",
+                triggered_at=index.isoformat(),
+                trigger_price=target_1,
+                high=high,
+                low=low,
+                close=close,
+                quantity=closed_qty,
+                currency_rate=currency_rate,
+                note=target_note,
+            )
+            return MonitorResult(ticker=ticker, status="EVENT", current_price=close, event=event)
+
+    update_position_excursion(position, bars)
+    return MonitorResult(ticker=ticker, status="HOLD", current_price=latest_close)
+
+
+def is_regular_session_bar(value: Any) -> bool:
+    """Return whether a provider bar starts inside the NYSE regular session."""
+    try:
+        moment = value.to_pydatetime() if hasattr(value, "to_pydatetime") else value
+        if not isinstance(moment, datetime) or moment.tzinfo is None:
+            return False
+        local_day = moment.astimezone(NY_TZ).date()
+        bounds = session_bounds(local_day)
+    except Exception:
+        return False
+    utc_moment = moment.astimezone(timezone.utc)
+    return bool(bounds and bounds[0] <= utc_moment < bounds[1])
+
+
+def extended_hours_target_confirmed(
+    bars: Any,
+    offset: int,
+    target: float,
+    required_bars: int,
+) -> bool:
+    """Reject isolated extended-hours prints by requiring consecutive closes."""
+    start = offset - required_bars + 1
+    if start < 0:
+        return False
+    window = bars.iloc[start:offset + 1]
+    if len(window) != required_bars:
+        return False
+    if any(is_regular_session_bar(stamp) for stamp in window.index):
+        return False
+    closes = window["Close"].astype(float)
+    if not bool((closes >= target).all()):
+        return False
+    stamps = [stamp.to_pydatetime() if hasattr(stamp, "to_pydatetime") else stamp for stamp in window.index]
+    return all(
+        isinstance(left, datetime)
+        and isinstance(right, datetime)
+        and 0 < (right - left).total_seconds() <= 5 * 60
+        for left, right in zip(stamps, stamps[1:])
+    )
+
+
+def build_event(
+    position: dict[str, Any],
+    *,
+    action: str,
+    triggered_at: str,
+    trigger_price: float,
+    high: float,
+    low: float,
+    close: float,
+    quantity: int,
+    currency_rate: float,
+    note: str,
+    observed_price: float | None = None,
+) -> PositionEvent:
+    trigger_price, details = sell_fill(position, action, trigger_price, observed_price)
+    return PositionEvent(
+        ticker=str(position.get("ticker") or "").upper(),
+        action=action,
+        triggered_at=triggered_at,
+        trigger_price=round(trigger_price, 4),
+        high=round(high, 4),
+        low=round(low, 4),
+        close=round(close, 4),
+        quantity=quantity,
+        cash_in=round(quantity * trigger_price * currency_rate, 2),
+        note=note,
+        trade_id=position_trade_id(position),
+        execution_details=details,
+    )
+
+
+def apply_event(
+    wb: Any,
+    open_positions: dict[str, dict[str, Any]],
+    position: dict[str, Any],
+    event: PositionEvent,
+    timestamp: str,
+    run_id: str,
+    currency_rate: float,
+) -> None:
+    entry_time = parse_timestamp(position.get("entry_date"))
+    triggered_at = parse_timestamp(event.triggered_at)
+    if (entry_time is None or triggered_at is None or triggered_at < entry_time
+            or event.trade_id != position_trade_id(position)
+            or event.ticker != position.get("ticker")
+            or open_positions.get(event.ticker) is not position
+            or not 0 < event.quantity <= int(position.get("quantity") or 0)):
+        raise ValueError("Position event does not belong to the current trade; no ledger changes made.")
+    append_position_event(wb, timestamp, run_id, position, event)
+    append_trade_log_row(wb, timestamp, position, event, currency_rate)
+
+    ticker = event.ticker
+    if event.action == "TAKE_PARTIAL_PROFIT":
+        remaining_qty = max(0, int(position.get("quantity") or 0) - event.quantity)
+        if remaining_qty <= 0:
+            open_positions.pop(ticker, None)
+            return
+        position["quantity"] = remaining_qty
+        position["current_price"] = event.trigger_price
+        position["stop_loss"] = float(position.get("entry_price") or event.trigger_price)
+        position["partial_taken"] = True
+        position["notes"] = "Partial profit taken; stop moved to breakeven."
+        refresh_position(position, event.trigger_price, currency_rate)
+        return
+
+    open_positions.pop(ticker, None)
+
+
+def refresh_position(position: dict[str, Any], current_price: float, currency_rate: float) -> None:
+    quantity = int(position.get("quantity") or 0)
+    entry = float(position.get("entry_price") or 0)
+    stop = float(position.get("stop_loss") or 0)
+    position["current_price"] = round(current_price, 4)
+    position["unrealized_usd"] = round((current_price - entry) * quantity, 2)
+    position["unrealized_ils"] = round((current_price - entry) * quantity * currency_rate, 2)
+    position["exposure_ils"] = round(current_price * quantity * currency_rate, 2)
+    position["risk_ils"] = round(max(0.0, entry - sell_fill(position, "EXIT_STOP", stop)[0]) * quantity * currency_rate, 2)
+    position["notes"] = position.get("notes") or "Open position refreshed by monitor."
+
+
+def update_position_excursion(position: dict[str, Any], bars: Any) -> None:
+    if bars is None or bars.empty:
+        return
+    entry = float(position.get("entry_price") or 0)
+    quantity = int(position.get("quantity") or 0)
+    if entry <= 0 or quantity <= 0:
+        return
+    high = float(bars["High"].max())
+    low = float(bars["Low"].min())
+    decision = parse_decision_json(position.get("decision_json", ""))
+    initial_quantity = int(decision.get("position_size") or decision.get("original_position_size") or quantity)
+    favorable_per_share = max(0.0, high - entry)
+    adverse_per_share = max(0.0, entry - low)
+    existing_mfe = float(decision.get("mfe") or 0)
+    existing_mae = float(decision.get("mae") or 0)
+    decision["mfe"] = round(max(existing_mfe, favorable_per_share * initial_quantity), 2)
+    decision["mae"] = round(max(existing_mae, adverse_per_share * initial_quantity), 2)
+    decision["mfe_per_share"] = round(max(float(decision.get("mfe_per_share") or 0), favorable_per_share), 4)
+    decision["mae_per_share"] = round(max(float(decision.get("mae_per_share") or 0), adverse_per_share), 4)
+    original_stop = float(decision.get("stop_loss") or position.get("stop_loss") or 0)
+    risk_per_share = max(0.0, entry - original_stop)
+    if risk_per_share > 0:
+        decision["mfe_r"] = round(float(decision["mfe_per_share"]) / risk_per_share, 4)
+        decision["mae_r"] = round(float(decision["mae_per_share"]) / risk_per_share, 4)
+    decision["excursion_source"] = "intraday_bars"
+    position["decision_json"] = json.dumps(decision, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def parse_decision_json(value: Any) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def event_r_multiple(
+    position: dict[str, Any],
+    event: PositionEvent,
+    decision: dict[str, Any] | None = None,
+) -> float | None:
+    entry = float(position.get("entry_price") or 0)
+    stop = float((decision or {}).get("stop_loss") or position.get("stop_loss") or 0)
+    if entry <= 0 or stop <= 0 or entry <= stop:
+        return None
+    return round((event.trigger_price - entry) / (entry - stop), 4)
+
+
+def position_duration(entry_date: Any, exit_date: Any) -> str | None:
+    entry = parse_timestamp(entry_date)
+    exit_at = parse_timestamp(exit_date)
+    if entry is None or exit_at is None:
+        return None
+    if entry.tzinfo is None:
+        entry = entry.replace(tzinfo=timezone.utc)
+    if exit_at.tzinfo is None:
+        exit_at = exit_at.replace(tzinfo=timezone.utc)
+    hours = max(
+        0.0,
+        (exit_at.astimezone(timezone.utc) - entry.astimezone(timezone.utc)).total_seconds() / 3600,
+    )
+    return f"{hours:.2f} hours"
+
+
+def trade_analytics_values(decision: dict[str, Any]) -> list[Any]:
+    return [
+        decision.get("trade_id", ""),
+        decision.get("setup_score_bucket", ""),
+        decision.get("entry_confirmation_status") or decision.get("confirmation_status", ""),
+        decision.get("mfe"),
+        decision.get("mae"),
+        decision.get("r_multiple"),
+        decision.get("duration"),
+        decision.get("exit_reason"),
+        decision.get("outcome_after_1d"),
+        decision.get("outcome_after_3d"),
+        decision.get("outcome_after_5d"),
+        decision.get("outcome_after_10d"),
+    ]
+
+
+def read_settings(wb: Any) -> dict[str, Any]:
+    ws = wb["Settings"]
+    values = {}
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row[0]:
+            values[str(row[0])] = row[1]
+    return values
+
+
+def read_open_positions(wb: Any) -> dict[str, dict[str, Any]]:
+    ws = wb["Open Positions"]
+    positions = {}
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row[0]:
+            continue
+        positions[str(row[0]).upper()] = {
+            "ticker": str(row[0]).upper(),
+            "entry_date": row[1],
+            "entry_price": float(row[2] or 0),
+            "current_price": float(row[3] or row[2] or 0),
+            "quantity": int(row[4] or 0),
+            "stop_loss": float(row[5] or 0),
+            "target_1": float(row[6] or 0),
+            "target_2": float(row[7] or 0),
+            "status": row[8] or "OPEN",
+            "unrealized_usd": float(row[9] or 0),
+            "unrealized_ils": float(row[10] or 0),
+            "exposure_ils": float(row[11] or 0),
+            "risk_ils": float(row[12] or 0),
+            "notes": str(row[13] or ""),
+            "screenshot": str(row[14] or ""),
+            "chart_url": str(row[15] or ""),
+            "selection_context": str(row[16] or ""),
+            "decision_json": str(row[17] or ""),
+            "partial_taken": "partial" in str(row[13] or "").lower(),
+        }
+    return positions
+
+
+def write_open_positions(wb: Any, positions: dict[str, dict[str, Any]]) -> None:
+    ws = wb["Open Positions"]
+    if ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row - 1)
+    for row_idx, position in enumerate(positions.values(), start=2):
+        values = [
+            position["ticker"],
+            position["entry_date"],
+            position["entry_price"],
+            position["current_price"],
+            position["quantity"],
+            position["stop_loss"],
+            position["target_1"],
+            position["target_2"],
+            position["status"],
+            position["unrealized_usd"],
+            position["unrealized_ils"],
+            position["exposure_ils"],
+            position["risk_ils"],
+            position.get("notes", ""),
+            position.get("screenshot", ""),
+            position.get("chart_url", ""),
+            position.get("selection_context", ""),
+            position.get("decision_json", ""),
+        ]
+        for col_idx, value in enumerate(values, start=1):
+            ws.cell(row_idx, col_idx, value)
+
+
+def ensure_agent_columns(wb: Any) -> None:
+    headers = {
+        "Trade Log": {
+            18: "Chart URL",
+            19: "Selection Context",
+            20: "Decision JSON",
+            21: "Trade ID",
+            22: "Setup Score Bucket",
+            23: "Entry Confirmation",
+            24: "MFE",
+            25: "MAE",
+            26: "R Multiple",
+            27: "Duration",
+            28: "Exit Reason",
+            29: "Outcome After 1D",
+            30: "Outcome After 3D",
+            31: "Outcome After 5D",
+            32: "Outcome After 10D",
+        },
+        "Open Positions": {
+            16: "Chart URL",
+            17: "Selection Context",
+            18: "Decision JSON",
+        },
+    }
+    for sheet_name, sheet_headers in headers.items():
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        for col_idx, header in sheet_headers.items():
+            ws.cell(1, col_idx, header)
+
+
+def ensure_position_events_sheet(wb: Any) -> None:
+    if EVENT_SHEET in wb.sheetnames:
+        wb[EVENT_SHEET].cell(1, 16, "Trade ID")
+        return
+    ws = wb.create_sheet(EVENT_SHEET)
+    headers = [
+        "Timestamp",
+        "Run ID",
+        "Ticker",
+        "Action",
+        "Triggered At",
+        "Trigger Price USD",
+        "Bar High USD",
+        "Bar Low USD",
+        "Bar Close USD",
+        "Quantity",
+        "Cash In",
+        "Stop Loss USD",
+        "Target 1 USD",
+        "Target 2 USD",
+        "Notes",
+        "Trade ID",
+    ]
+    for col_idx, header in enumerate(headers, start=1):
+        ws.cell(1, col_idx, header)
+
+
+def position_trade_id(position: dict[str, Any]) -> str:
+    decision = parse_decision_json(position.get("decision_json", ""))
+    identity = str(position.get("trade_id") or decision.get("trade_id") or "")
+    if identity:
+        return identity
+    entry = parse_timestamp(position.get("entry_date"))
+    return f"{position.get('ticker')}:{entry.isoformat()}" if entry else ""
+
+
+def read_last_event_times(wb: Any, positions: dict[str, dict[str, Any]]) -> dict[str, datetime]:
+    if EVENT_SHEET not in wb.sheetnames:
+        return {}
+    latest: dict[str, datetime] = {}
+    ws = wb[EVENT_SHEET]
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        ticker = str(row[2] or "").upper()
+        triggered_at = parse_timestamp(row[4])
+        position = positions.get(ticker)
+        if not position or str(row[3] or "").startswith("VOID"):
+            continue
+        entry = parse_timestamp(position.get("entry_date"))
+        recorded = parse_timestamp(row[0])
+        trade_id = str(row[15] or "") if len(row) > 15 else ""
+        if (entry is None or triggered_at is None or triggered_at < entry
+                or recorded is None or recorded < entry
+                or (trade_id and trade_id != position_trade_id(position))):
+            continue
+        if ticker and triggered_at and triggered_at > latest.get(ticker, datetime.min.replace(tzinfo=timezone.utc)):
+            latest[ticker] = triggered_at
+    return latest
+
+
+def append_position_event(
+    wb: Any,
+    timestamp: str,
+    run_id: str,
+    position: dict[str, Any],
+    event: PositionEvent,
+) -> None:
+    ws = wb[EVENT_SHEET]
+    row = next_row(ws)
+    values = [
+        timestamp,
+        run_id,
+        event.ticker,
+        event.action,
+        event.triggered_at,
+        event.trigger_price,
+        event.high,
+        event.low,
+        event.close,
+        event.quantity,
+        event.cash_in,
+        position.get("stop_loss"),
+        position.get("target_1"),
+        position.get("target_2"),
+        event.note,
+        event.trade_id,
+    ]
+    for col_idx, value in enumerate(values, start=1):
+        ws.cell(row, col_idx, value)
+
+
+def append_trade_log_row(
+    wb: Any,
+    timestamp: str,
+    position: dict[str, Any],
+    event: PositionEvent,
+    currency_rate: float,
+) -> None:
+    ws = wb["Trade Log"]
+    row = next_row(ws)
+    ws.cell(row, 1, timestamp)
+    ws.cell(row, 2, event.action)
+    ws.cell(row, 3, event.ticker)
+    ws.cell(row, 4, None)
+    ws.cell(row, 5, event.trigger_price)
+    ws.cell(row, 6, event.quantity)
+    ws.cell(row, 7, currency_rate)
+    ws.cell(row, 8, 0)
+    ws.cell(row, 9, event.cash_in)
+    ws.cell(row, 10, 0)
+    ws.cell(row, 11, event.cash_in)
+    ws.cell(row, 12, position.get("stop_loss"))
+    ws.cell(row, 13, position.get("target_1"))
+    ws.cell(row, 14, position.get("target_2"))
+    ws.cell(row, 15, 0)
+    ws.cell(row, 16, event.note)
+    ws.cell(row, 17, position.get("screenshot", ""))
+    ws.cell(row, 18, position.get("chart_url", ""))
+    ws.cell(row, 19, position.get("selection_context", ""))
+    ws.cell(row, 20, position.get("decision_json", ""))
+    analytics = parse_decision_json(position.get("decision_json", ""))
+    analytics.update(event.execution_details)
+    analytics["exit_reason"] = event.action
+    analytics["r_multiple"] = event_r_multiple(position, event, analytics)
+    analytics["duration"] = position_duration(position.get("entry_date"), event.triggered_at)
+    ws.cell(row, 20, json.dumps(analytics, ensure_ascii=False, sort_keys=True, default=str))
+    for col_idx, value in enumerate(trade_analytics_values(analytics), start=21):
+        ws.cell(row, col_idx, value)
+
+
+def append_update_log(
+    wb: Any,
+    *,
+    timestamp: str,
+    run_id: str,
+    tickers: list[str],
+    actions: list[PositionEvent],
+    cash: float,
+    exposure: float,
+    open_risk: float,
+    open_positions: int,
+    summary_path: Path,
+) -> None:
+    ws = wb["Update Log"]
+    row = next_row(ws)
+    actions_summary = ", ".join(f"{event.ticker}:{event.action}" for event in actions) or "MONITOR:HOLD"
+    ws.cell(row, 1, timestamp)
+    ws.cell(row, 2, run_id)
+    ws.cell(row, 3, " ".join(tickers))
+    ws.cell(row, 4, 0)
+    ws.cell(row, 5, actions_summary)
+    ws.cell(row, 6, cash)
+    ws.cell(row, 7, exposure)
+    ws.cell(row, 8, open_risk)
+    ws.cell(row, 9, open_positions)
+    ws.cell(row, 10, portable_path(summary_path))
+    ws.cell(row, 11, "")
+
+
+def compute_cash(wb: Any, starting_capital: float) -> float:
+    ws = wb["Trade Log"]
+    cash_out = 0.0
+    cash_in = 0.0
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        cash_out += float(row[9] or 0)
+        cash_in += float(row[10] or 0)
+    return round(starting_capital - cash_out + cash_in, 2)
+
+
+def write_summary(
+    *,
+    settings: MonitorSettings,
+    run_id: str,
+    timestamp: str,
+    results: list[MonitorResult],
+    cash: float,
+    exposure: float,
+    open_risk: float,
+    currency: str,
+) -> Path:
+    summary_dir = settings.run_dir / "position_monitor"
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = summary_dir / f"position_monitor_{run_id}.md"
+    events = [result.event for result in results if result.event]
+    health = classify_monitor_results(results)
+    errors = [result for result in results if result.error or result.status in {"ERROR", "DATA_ERROR", "NO_DATA"}]
+    lines = [
+        "Market Lens Position Monitor Update",
+        "",
+        f"Date: {timestamp}",
+        f"Run status: {'OK' if not errors else 'ISSUES'}",
+        f"Evaluation status: {health['status']}",
+        f"Open positions checked: {len(results)}",
+        f"Events found: {len(events)}",
+        f"Actions taken: {', '.join(f'{event.ticker}:{event.action}' for event in events) or 'None'}",
+        f"Cash remaining: {cash:.2f} {currency}",
+        f"Current exposure: {exposure:.2f} {currency}",
+        f"Total open risk: {open_risk:.2f} {currency}",
+        f"Excel updated: {settings.excel_path}",
+        f"Errors: {'; '.join(f'{result.ticker}: {result.error or result.status}' for result in errors) if errors else 'None'}",
+        "Agent feedback:",
+    ]
+    for result in results:
+        if result.event:
+            lines.append(f"- {result.event.ticker}: {result.event.action} - {result.event.note}")
+        elif result.error:
+            lines.append(f"- {result.ticker}: DATA_ERROR - {result.error}")
+        else:
+            lines.append(f"- {result.ticker}: {result.status} - no target or stop event detected.")
+    summary_path.write_text("\n".join(lines), encoding="utf-8")
+    return summary_path
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return ensure_utc(value)
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return ensure_utc(datetime.fromisoformat(text.replace("Z", "+00:00")))
+    except ValueError:
+        try:
+            return ensure_utc(datetime.strptime(text[:19], "%Y-%m-%dT%H:%M:%S"))
+        except ValueError:
+            return None
+
+
+def ensure_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def next_row(ws: Any) -> int:
+    for row in range(2, ws.max_row + 2):
+        if ws.cell(row, 1).value is None:
+            return row
+    return ws.max_row + 1
+
+
+def portable_path(path: Path) -> str:
+    try:
+        return path.relative_to(ROOT).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+if __name__ == "__main__":
+    main()

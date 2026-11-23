@@ -1,0 +1,336 @@
+import json
+from types import SimpleNamespace
+from datetime import datetime, timedelta, timezone
+
+import pandas as pd
+import pytest
+from openpyxl import Workbook
+
+from agent.position_monitor import (
+    MonitorSettings, apply_event, build_event, ensure_position_events_sheet,
+    monitor_position, position_trade_id, read_last_event_times,
+    process_position_window, classify_monitor_results,
+)
+from agent.market_lens_ui_agent import capture_position_exit_plan, append_trade_log_row
+
+
+def test_scanner_exit_ledger_preserves_original_plan(tmp_path):
+    p = position()
+    payload = {}
+    capture_position_exit_plan(payload, p)
+    p["stop_loss"] = p["entry_price"]
+    result = SimpleNamespace(ticker="CHTR", current_price=160, stop_loss=155,
+                             target_1=170, target_2=190, chart_url="", selection_context="")
+    decision = SimpleNamespace(action="TAKE_PARTIAL_PROFIT", execution_price=159.44,
+                               quantity=13, cash_in_ils=2072.72, cash_out_ils=0,
+                               risk_ils=0, feedback="TP1", decision_json=payload)
+    wb = book()
+    append_trade_log_row(wb, "2026-09-08T14:00:00Z", result, decision, 1, tmp_path / "chart.png")
+    ws = wb["Trade Log"]
+    assert [ws.cell(2, c).value for c in (12, 13, 14, 21)] == [146.49, 159.44, 180.62, "new-trade"]
+
+
+def position():
+    return dict(ticker="CHTR", entry_date="2026-09-04T14:06:53Z", entry_price=150.36,
+                quantity=26, stop_loss=146.49, target_1=159.44, target_2=180.62,
+                decision_json=json.dumps({"trade_id": "new-trade"}), partial_taken=False)
+
+
+def book():
+    wb = Workbook()
+    wb.active.title = "Trade Log"
+    wb.active.append(["Header"] * 32)
+    ensure_position_events_sheet(wb)
+    return wb
+
+
+def settings(tmp_path):
+    return MonitorSettings(tmp_path / "unused.xlsx", tmp_path, "5d", "1m", False, "")
+
+
+class FakeClock:
+    def __init__(self, value: datetime) -> None:
+        self.value = value
+
+    def now(self) -> datetime:
+        return self.value
+
+    def advance(self, **kwargs) -> None:
+        self.value += timedelta(**kwargs)
+
+
+def test_fake_clock_price_window_persists_tp1_then_tp2_once(monkeypatch, tmp_path):
+    clock = FakeClock(datetime(2026, 9, 8, 14, 15, tzinfo=timezone.utc))
+    frame = pd.DataFrame(
+        {"Open": [155.0, 175.0], "High": [160.0, 182.0], "Low": [155.0, 175.0], "Close": [159.0, 181.0]},
+        index=pd.to_datetime(["2026-09-08T14:11:00Z", "2026-09-08T14:12:00Z"]),
+    )
+    monkeypatch.setattr("agent.position_monitor.fetch_intraday_frame", lambda *a, **k: frame)
+    wb, p = book(), position()
+    positions = {"CHTR": p}
+
+    first, notifications = process_position_window(
+        wb,
+        positions,
+        p,
+        settings=settings(tmp_path),
+        since=None,
+        currency_rate=1,
+        timestamp=clock.now().isoformat(),
+        run_id="fake-clock-first",
+    )
+    assert [item.event.action for item in first] == ["TAKE_PARTIAL_PROFIT", "TAKE_PROFIT"]
+    assert [item.event.quantity for item in first] == [13, 13]
+    assert positions == {}
+    assert len(notifications) == 2
+    assert wb["Trade Log"].max_row == 3
+    assert wb["Position Events"].max_row == 3
+
+    clock.advance(minutes=1)
+    stale_retry = position()
+    replay, replay_notifications = process_position_window(
+        wb,
+        {"CHTR": stale_retry},
+        stale_retry,
+        settings=settings(tmp_path),
+        since=datetime(2026, 9, 8, 14, 12, tzinfo=timezone.utc),
+        currency_rate=1,
+        timestamp=clock.now().isoformat(),
+        run_id="fake-clock-retry",
+    )
+    assert replay[0].status == "NO_NEW_BARS"
+    assert replay_notifications == []
+    assert wb["Trade Log"].max_row == 3
+    assert wb["Position Events"].max_row == 3
+
+
+@pytest.mark.parametrize("terminal,high,low,expected_price", [
+    ("EXIT_STOP", 156, 149, 150.36),
+    ("TAKE_PROFIT", 182, 175, 180.62),
+])
+def test_window_applies_partial_then_later_terminal_once(monkeypatch, tmp_path, terminal, high, low, expected_price):
+    frame = pd.DataFrame({"Open": [155, low], "High": [160, high], "Low": [155, low], "Close": [159, high - 1]},
+                         index=pd.to_datetime(["2026-09-08T14:11:00Z", "2026-09-08T14:12:00Z"]))
+    calls = []
+    def fetch(*args, **kwargs):
+        calls.append(1)
+        return frame
+    monkeypatch.setattr("agent.position_monitor.fetch_intraday_frame", fetch)
+    wb, p = book(), position()
+    positions = {"CHTR": p}
+    results, notifications = process_position_window(
+        wb, positions, p, settings=settings(tmp_path), since=None,
+        currency_rate=1, timestamp="2026-09-08T14:15:00Z", run_id="window",
+    )
+    assert [r.event.action for r in results] == ["TAKE_PARTIAL_PROFIT", terminal]
+    assert [r.event.quantity for r in results] == [13, 13]
+    assert results[-1].event.trigger_price == expected_price
+    assert sum(r.event.cash_in for r in results) == pytest.approx(round(13 * (159.44 + expected_price), 2))
+    assert len(calls) == 1
+    assert positions == {}
+    assert wb["Trade Log"].max_row == 3
+    assert wb["Position Events"].max_row == 3
+    assert notifications[0][0]["quantity"] == 26
+    assert notifications[1][0]["quantity"] == 13
+    assert notifications[1][0]["stop_loss"] == 150.36
+    assert classify_monitor_results(results)["positions_checked"] == 1
+
+
+def test_window_partial_then_hold_refreshes_and_replay_is_noop(monkeypatch, tmp_path):
+    frame = pd.DataFrame({"Open": [155, 158], "High": [160, 165], "Low": [155, 158], "Close": [159, 164]},
+                         index=pd.to_datetime(["2026-09-08T14:11:00Z", "2026-09-08T14:12:00Z"]))
+    monkeypatch.setattr("agent.position_monitor.fetch_intraday_frame", lambda *a, **k: frame)
+    wb, p = book(), position()
+    positions = {"CHTR": p}
+    args = dict(settings=settings(tmp_path), currency_rate=1,
+                timestamp="2026-09-08T14:15:00Z", run_id="window")
+    results, _ = process_position_window(wb, positions, p, since=None, **args)
+    assert len(results) == 1
+    assert p["current_price"] == 164
+    assert p["quantity"] == 13
+    cursor = read_last_event_times(wb, positions)["CHTR"]
+    again, notifications = process_position_window(wb, positions, p, since=cursor, **args)
+    assert again[0].status == "HOLD"
+    assert not notifications
+    assert wb["Trade Log"].max_row == 2
+
+
+def test_window_does_not_infer_new_stop_order_inside_tp1_candle(monkeypatch, tmp_path):
+    frame = pd.DataFrame({"Open": [155], "High": [160], "Low": [149], "Close": [159]},
+                         index=pd.to_datetime(["2026-09-08T14:11:00Z"]))
+    monkeypatch.setattr("agent.position_monitor.fetch_intraday_frame", lambda *a, **k: frame)
+    wb, p = book(), position()
+    results, _ = process_position_window(
+        wb, {"CHTR": p}, p, settings=settings(tmp_path), since=None,
+        currency_rate=1, timestamp="2026-09-08T14:15:00Z", run_id="window",
+    )
+    assert len(results) == 1
+    assert results[0].event.action == "TAKE_PARTIAL_PROFIT"
+    assert p["quantity"] == 13
+
+
+def test_extended_hours_target_executes_but_stop_remains_regular_only(monkeypatch, tmp_path):
+    frame = pd.DataFrame(
+        {"High": [181, 182], "Low": [140, 140], "Close": [181, 181.5]},
+        index=pd.to_datetime([
+            "2026-09-08T12:00:00Z",  # 08:00 New York
+            "2026-09-08T12:01:00Z",
+        ]),
+    )
+    fetch_kwargs = {}
+
+    def fetch(*args, **kwargs):
+        fetch_kwargs.update(kwargs)
+        return frame
+
+    monkeypatch.setattr("agent.position_monitor.fetch_intraday_frame", fetch)
+    result = monitor_position(position(), settings=settings(tmp_path), since=None, currency_rate=1)
+
+    assert fetch_kwargs["include_prepost"] is True
+    assert result.event is not None
+    assert result.event.action == "TAKE_PROFIT"
+    assert result.event.trigger_price == 180.62
+    assert "2 consecutive completed extended-hours minute closes" in result.event.note
+
+
+def test_isolated_extended_hours_target_print_is_ignored(monkeypatch, tmp_path):
+    frame = pd.DataFrame(
+        {"High": [190, 170], "Low": [149, 160], "Close": [150, 165]},
+        index=pd.to_datetime(["2026-09-08T12:00:00Z", "2026-09-08T12:01:00Z"]),
+    )
+    monkeypatch.setattr("agent.position_monitor.fetch_intraday_frame", lambda *a, **k: frame)
+
+    result = monitor_position(position(), settings=settings(tmp_path), since=None, currency_rate=1)
+
+    assert result.status == "HOLD"
+    assert result.event is None
+
+
+def test_extended_hours_events_can_be_disabled(monkeypatch, tmp_path):
+    frame = pd.DataFrame(
+        {"High": [181], "Low": [140], "Close": [180]},
+        index=pd.to_datetime(["2026-09-08T12:00:00Z"]),
+    )
+    monkeypatch.setattr("agent.position_monitor.fetch_intraday_frame", lambda *a, **k: frame)
+    policy = settings(tmp_path)
+    policy.extended_hours_targets = False
+    policy.extended_hours_stops = False
+
+    result = monitor_position(position(), settings=policy, since=None, currency_rate=1)
+
+    assert result.status == "HOLD"
+    assert result.event is None
+
+
+def test_previous_trade_stop_bar_cannot_close_reentry(monkeypatch, tmp_path):
+    frame = pd.DataFrame({"High": [146.94, 151, 152], "Low": [146.365, 150, 151],
+                          "Close": [146.365, 150.5, 151.5]},
+                         index=pd.to_datetime(["2026-09-01T14:11:00Z", "2026-09-04T14:07:00Z", "2026-09-08T14:00:00Z"]))
+    monkeypatch.setattr("agent.position_monitor.fetch_intraday_frame", lambda *a, **k: frame)
+    p = position()
+    result = monitor_position(p, settings=settings(tmp_path),
+                              since=datetime.fromisoformat("2026-09-01T13:30:00+00:00"), currency_rate=1)
+    assert result.status == "HOLD" and result.event is None
+    assert json.loads(p["decision_json"])["mae"] < 26
+
+
+def test_missing_entry_is_not_replaced_with_old_event_cursor(tmp_path):
+    p = position()
+    p["entry_date"] = ""
+    result = monitor_position(p, settings=settings(tmp_path), since=None, currency_rate=1)
+    assert result.status == "DATA_ERROR"
+
+
+@pytest.mark.parametrize("high,low,close", [
+    (float("nan"), 150, 151), (152, 150, float("inf")),
+    (149, 151, 150), (152, 150, 153), (152, 0, 151),
+])
+def test_bad_price_bar_is_data_error_not_hold_or_exit(monkeypatch, tmp_path, high, low, close):
+    frame = pd.DataFrame({"High": [high], "Low": [low], "Close": [close]},
+                         index=pd.to_datetime(["2026-09-08T14:11:00Z"]))
+    monkeypatch.setattr("agent.position_monitor.fetch_intraday_frame", lambda *a, **k: frame)
+    p = position()
+    before = dict(p)
+    result = monitor_position(p, settings=settings(tmp_path), since=None, currency_rate=1)
+    assert result.status == "DATA_ERROR"
+    assert result.event is None
+    assert p == before
+
+
+def test_cursor_ignores_other_trades_and_pre_entry_legacy_events():
+    wb = book()
+    ws = wb["Position Events"]
+    for recorded, triggered, identity in [
+        ("2026-09-08T13:26:07Z", "2026-09-01T14:11:00Z", ""),
+        ("2026-09-08T16:00:00Z", "2026-09-08T15:00:00Z", "old-trade"),
+        ("2026-09-08T14:00:00Z", "2026-09-08T13:59:00Z", "new-trade"),
+    ]:
+        ws.append([recorded, "run", "CHTR", "TAKE_PARTIAL_PROFIT", triggered] + [None] * 10 + [identity])
+    assert read_last_event_times(wb, {"CHTR": position()})["CHTR"].isoformat() == "2026-09-08T13:59:00+00:00"
+
+
+@pytest.mark.parametrize("bad_time,bad_id", [(True, False), (False, True)])
+def test_invalid_event_cannot_mutate_ledger(bad_time, bad_id):
+    p = position()
+    event = build_event(p, action="EXIT_STOP", triggered_at="2026-09-01T14:11:00Z" if bad_time else "2026-09-08T14:11:00Z",
+                        trigger_price=146.49, high=147, low=146, close=146.5,
+                        quantity=26, currency_rate=1, note="test")
+    if bad_id:
+        event.trade_id = "another-trade"
+    wb = book()
+    with pytest.raises(ValueError, match="current trade"):
+        apply_event(wb, {"CHTR": p}, p, event, "2026-09-08T14:12:00Z", "run", 1)
+    assert wb["Trade Log"].max_row == 1
+    assert wb["Position Events"].max_row == 1
+    assert p["quantity"] == 26
+
+
+def test_tp1_is_bound_to_trade_and_advances_stop_and_cursor():
+    p = position()
+    event = build_event(p, action="TAKE_PARTIAL_PROFIT", triggered_at="2026-09-08T14:11:00Z",
+                        trigger_price=159.44, high=160, low=158, close=159.5,
+                        quantity=13, currency_rate=1, note="test")
+    wb = book()
+    positions = {"CHTR": p}
+    apply_event(wb, positions, p, event, "2026-09-08T14:12:00Z", "run", 1)
+    assert p["quantity"] == 13
+    assert p["stop_loss"] == p["entry_price"]
+    assert p["risk_ils"] == 0
+    assert p["partial_taken"] is True
+    assert wb["Position Events"].cell(2, 16).value == "new-trade"
+    assert read_last_event_times(wb, positions)["CHTR"].isoformat() == "2026-09-08T14:11:00+00:00"
+
+
+def test_legacy_identity_includes_entry_timestamp():
+    p = position()
+    p["decision_json"] = ""
+    first = position_trade_id(p)
+    p["entry_date"] = "2026-09-08T14:00:00Z"
+    assert first != position_trade_id(p)
+
+
+@pytest.mark.parametrize('terminal,high,low,opening,expected', [
+    ('EXIT_STOP', 149, 147, 148, 147.6),
+    ('TAKE_PROFIT', 182, 175, 177, 180.32),
+])
+def test_costed_window_partial_then_terminal_preserves_fill_metadata(monkeypatch, tmp_path, terminal, high, low, opening, expected):
+    from app.execution import EXECUTION_VERSION, STRATEGY_VERSION
+    frame = pd.DataFrame({'Open': [155, opening], 'High': [160, high],
+                          'Low': [155, low], 'Close': [159, high - 1]},
+                         index=pd.to_datetime(['2026-09-08T14:11:00Z', '2026-09-08T14:12:00Z']))
+    monkeypatch.setattr('agent.position_monitor.fetch_intraday_frame', lambda *a, **k: frame)
+    wb, p = book(), position()
+    p['decision_json'] = json.dumps(dict(trade_id='new-trade', strategy_version=STRATEGY_VERSION,
+        execution_model_version=EXECUTION_VERSION, execution_cost_policy=dict(
+            half_spread_per_share=.1, slippage_per_share=.2, fee_per_share=.1)))
+    positions = {'CHTR': p}
+    results, _ = process_position_window(wb, positions, p, settings=settings(tmp_path),
+        since=None, currency_rate=1, timestamp='2026-09-08T14:15:00Z', run_id='costed')
+    assert [r.event.action for r in results] == ['TAKE_PARTIAL_PROFIT', terminal]
+    assert results[0].event.trigger_price == 159.14
+    assert results[1].event.trigger_price == expected
+    assert [r.event.quantity for r in results] == [13, 13]
+    assert not positions
+    exit_meta = json.loads(wb['Trade Log'].cell(3, 20).value)
+    assert exit_meta['exit_execution_price'] == expected
+    assert exit_meta['execution_model_version'] == EXECUTION_VERSION

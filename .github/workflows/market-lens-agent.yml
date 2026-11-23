@@ -1,0 +1,371 @@
+name: Market Lens Paper Agent Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Run immediately, bypassing the New York scan-time guard"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: market-lens-repo-writes
+  cancel-in-progress: false
+
+jobs:
+  run-agent:
+    if: ${{ false }} # Historical workflow only; the Linux host is the sole writer.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check New York scan schedule
+        id: schedule_time
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ] && [ "${{ github.event.inputs.force || 'false' }}" = "true" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          local_day="$(TZ=America/New_York date +%u)"
+          local_time="$(TZ=America/New_York date +%H:%M)"
+
+          should_run=false
+
+          # Weekday off-hours staging scans plus regular-session confirmation scans.
+          if [ "$local_day" -le 5 ]; then
+            case "$local_time" in
+              "00:30"|"01:30"|"02:30"|"03:30"|"04:30"|"05:30"|"06:30"|"07:30"|"08:30"|"09:10"|"09:35"|"09:45"|"10:00"|"10:30"|"11:00"|"11:30"|"12:00"|"12:30"|"13:00"|"13:30"|"14:00"|"14:30"|"15:00"|"15:30"|"15:55"|"16:15"|"16:20"|"17:30"|"18:30"|"19:30"|"20:15"|"21:30"|"22:30"|"23:30")
+                should_run=true
+                ;;
+            esac
+          fi
+
+          # Weekend research/staging scans. These can stage WATCH_READY only, not BUY_SIMULATED.
+          if [ "$local_day" = "6" ]; then
+            case "$local_time" in
+              "11:00")
+                should_run=true
+                ;;
+            esac
+          fi
+
+          if [ "$local_day" = "7" ]; then
+            case "$local_time" in
+              "18:30"|"22:00")
+                should_run=true
+                ;;
+            esac
+          fi
+
+          if [ "$should_run" = "true" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Outside configured New York scan times; skipping."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.schedule_time.outputs.should_run == 'true'
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Refresh portfolio baseline
+        if: steps.schedule_time.outputs.should_run == 'true'
+        shell: bash
+        run: |
+          git fetch origin main
+          git reset --hard origin/main
+          git clean -fd
+
+      - name: Set up Python
+        if: steps.schedule_time.outputs.should_run == 'true'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        if: steps.schedule_time.outputs.should_run == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m playwright install --with-deps chromium
+
+      - name: Start local Market Lens app
+        if: steps.schedule_time.outputs.should_run == 'true'
+        shell: bash
+        run: |
+          python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > /tmp/market-lens-app.log 2>&1 &
+          echo $! > /tmp/market-lens-app.pid
+
+          for attempt in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:8000/health >/dev/null; then
+              echo "Local Market Lens app is ready."
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Local Market Lens app did not become ready."
+          cat /tmp/market-lens-app.log || true
+          exit 1
+
+      - name: Run Market Lens UI agent
+        if: steps.schedule_time.outputs.should_run == 'true'
+        timeout-minutes: 22
+        env:
+          MARKET_LENS_URL: http://127.0.0.1:8000/?v=agent
+          MARKET_LENS_PUBLIC_URL: https://market-lens-scanner-fb63.onrender.com
+          MARKET_LENS_EMAIL: ${{ secrets.MARKET_LENS_EMAIL }}
+          MARKET_LENS_PASSWORD: ${{ secrets.MARKET_LENS_PASSWORD }}
+          MARKET_LENS_EXCEL_PATH: agent_tracker/market_lens_agent_portfolio_budget_100k.xlsx
+          MARKET_LENS_RUN_DIR: agent_results
+          MARKET_LENS_REGIME_CACHE_PATH: agent_results/regime/market_regime_lkg.json
+          MARKET_LENS_REGIME_LKG_MAX_SESSION_AGE: "3"
+          MARKET_LENS_UNIVERSE: smart-universe
+          MARKET_LENS_TICKERS: ""
+          MARKET_LENS_ANALYSIS_PERIOD: 6mo
+          MARKET_LENS_MIN_RR: "2"
+          MARKET_LENS_HEADLESS: "true"
+          MARKET_LENS_AGENT_TIMEOUT_SECONDS: "900"
+          MARKET_LENS_AGENT_UNIVERSE_TARGET: "150"
+          MARKET_LENS_AGENT_UNIVERSE_POOL: "350"
+          MARKET_LENS_AGENT_UNIVERSE_MAX_POOL: "500"
+          MARKET_LENS_AGENT_MAX_PER_SECTOR: "20"
+          MARKET_LENS_AGENT_TOTAL_SCAN_LIMIT: "180"
+          MARKET_LENS_AGENT_SCAN_BATCH_SIZE: "10"
+          MARKET_LENS_AGENT_BATCH_PAUSE_MS: "750"
+          MARKET_LENS_AGENT_RETRY_PAUSE_MS: "20000"
+          MARKET_LENS_AGENT_RECENT_SKIP_FALLBACK: "true"
+          MARKET_LENS_AGENT_CARRY_FORWARD_LIMIT: "30"
+          MARKET_LENS_AGENT_NEAR_MISS_LIMIT: "20"
+          MARKET_LENS_AGENT_NEAR_MISS_DAYS: "5"
+          MARKET_LENS_AGENT_NEAR_MISS_MIN_SETUP_SCORE: "0.35"
+          MARKET_LENS_AGENT_NEAR_MISS_MIN_NET_RR: "1.50"
+          MARKET_LENS_AGENT_OFF_HOURS_DISCOVERY_ENABLED: "true"
+          MARKET_LENS_AGENT_OFF_HOURS_EXTRA_TARGET: "25"
+          MARKET_LENS_AGENT_SUPPLEMENT_CURATED_UNIVERSE: "true"
+          MARKET_LENS_AGENT_MIN_SPLIT_BATCH_SIZE: "2"
+          MARKET_LENS_AGENT_MISSING_RECOVERY_ENABLED: "true"
+          MARKET_LENS_AGENT_MISSING_RECOVERY_MAX_TICKERS: "12"
+          MARKET_LENS_AGENT_MISSING_RECOVERY_ROUNDS: "2"
+          MARKET_LENS_AGENT_MISSING_RECOVERY_BATCH_SIZE: "4"
+          MARKET_LENS_AGENT_MISSING_RECOVERY_MIN_REMAINING_SECONDS: "90"
+          MARKET_LENS_AGENT_MISSING_RECOVERY_PAUSE_MS: "2000"
+          MARKET_LENS_SKIP_COOLDOWN_HOURS: "8"
+          MARKET_LENS_WATCH_READY_CARRY_FORWARD_DAYS: "5"
+          MARKET_LENS_WATCH_CARRY_FORWARD_DAYS: "14"
+          MARKET_LENS_WORKBOOK_WATCHLIST_MAX_ROWS: "20000"
+          MARKET_LENS_BULL_MIN_SETUP_SCORE: "0.45"
+          MARKET_LENS_NEUTRAL_MIN_SETUP_SCORE: "0.55"
+          MARKET_LENS_MIN_PRIMARY_NET_RR: "0.80"
+          MARKET_LENS_PREFERRED_PRIMARY_NET_RR: "1.00"
+          MARKET_LENS_PRIMARY_RR_WEIGHT: "0.80"
+          MARKET_LENS_STRETCH_RR_WEIGHT: "0.20"
+          MARKET_LENS_MIN_TARGET1_ATR_DISTANCE: "0.75"
+          MARKET_LENS_REQUIRE_ENTRY_CONFIRMATION: "true"
+          MARKET_LENS_ENTRY_CONFIRMATION_INTRADAY_ENABLED: "true"
+          MARKET_LENS_ENTRY_CONFIRMATION_INTRADAY_INTERVAL: "30m"
+          MARKET_LENS_ENTRY_CONFIRMATION_INTRADAY_PERIOD: "5d"
+          MARKET_LENS_ENTRY_CONFIRMATION_LOOKBACK_CANDLES: "3"
+          MARKET_LENS_TRADE_OUTCOME_BACKFILL_LIMIT: "8"
+          MARKET_LENS_SHADOW_REENTRY_MIN_SCORE: "0.50"
+          MARKET_LENS_NEUTRAL_PILOT_ENABLED: "true"
+          MARKET_LENS_NEUTRAL_PILOT_MIN_SETUP_SCORE: "0.45"
+          MARKET_LENS_NEUTRAL_PILOT_MIN_NET_RR: "2.0"
+          MARKET_LENS_NEUTRAL_PILOT_POSITION_PCT: "0.50"
+          MARKET_LENS_NEUTRAL_PILOT_MAX_TRADES_PER_DAY: "2"
+          MARKET_LENS_STOP_COOLDOWN_DAYS: "3"
+          MARKET_LENS_COOLDOWN_EXCEPTION_SETUP_SCORE: "0.60"
+          MARKET_LENS_COOLDOWN_EXCEPTION_NET_RR1: "1.20"
+          MARKET_LENS_ALLOW_BUY_OUTSIDE_REGULAR_HOURS: "false"
+          MARKET_LENS_SAVE_REJECTED_CHARTS: "false"
+          MARKET_LENS_REJECTED_CHART_LIMIT: "15"
+          MARKET_LENS_REJECTED_CHART_MIN_SCORE: "0.40"
+          MARKET_LENS_TELEGRAM_QUALIFIED_BLOCKED_ENABLED: "true"
+          MARKET_LENS_AGENT_NOTIFICATION_OUTBOX: ${{ runner.temp }}/market-lens-buy-notifications.json
+        run: python agent/market_lens_ui_agent.py
+
+      - name: Apply Agent media retention
+        if: steps.schedule_time.outputs.should_run == 'true'
+        env:
+          MARKET_LENS_AGENT_MEDIA_RETENTION_ENABLED: "true"
+          MARKET_LENS_AGENT_CHART_RETENTION_MAX_FILES: "180"
+          MARKET_LENS_AGENT_SCREENSHOT_RETENTION_MAX_FILES: "60"
+          MARKET_LENS_AGENT_CHART_RETENTION_MAX_MB: "120"
+          MARKET_LENS_AGENT_SCREENSHOT_RETENTION_MAX_MB: "60"
+          MARKET_LENS_AGENT_CHART_RETENTION_MAX_AGE_DAYS: "21"
+          MARKET_LENS_AGENT_SCREENSHOT_RETENTION_MAX_AGE_DAYS: "14"
+        run: python agent/cleanup_agent_results.py
+
+      - name: Write dashboard snapshot
+        if: steps.schedule_time.outputs.should_run == 'true'
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from app.agent_dashboard import build_agent_dashboard, write_diagnostic_snapshot
+
+          snapshot = build_agent_dashboard(Path("."))
+          output = Path("agent_results/dashboard_snapshot.json")
+          output.parent.mkdir(parents=True, exist_ok=True)
+          output.write_text(json.dumps(snapshot, default=str, separators=(",", ":")), encoding="utf-8")
+          print(f"Wrote {output}")
+          diagnostics_output = write_diagnostic_snapshot(Path("."), snapshot)
+          if diagnostics_output:
+              print(f"Wrote {diagnostics_output}")
+          PY
+
+      - name: Enforce tracker size before persistence
+        if: steps.schedule_time.outputs.should_run == 'true'
+        env:
+          MARKET_LENS_WORKBOOK_WATCHLIST_MAX_ROWS: "20000"
+          MARKET_LENS_WORKBOOK_REWRITE_BYTES: "50000000"
+          MARKET_LENS_WORKBOOK_HARD_LIMIT_BYTES: "90000000"
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from app.workbook_retention import enforce_tracker_size
+
+          result = enforce_tracker_size(
+              Path("agent_tracker/market_lens_agent_portfolio_budget_100k.xlsx")
+          )
+          print(
+              "Tracker size guard: "
+              f"before={result['size_before']} after={result['size_after']} "
+              f"rewritten={result['rewritten']}"
+          )
+          PY
+
+      - name: Commit agent results safely
+        id: persist
+        if: steps.schedule_time.outputs.should_run == 'true'
+        shell: bash
+        run: |
+          set -e
+
+          git config user.name "market-lens-agent"
+          git config user.email "market-lens-agent@users.noreply.github.com"
+          BASE_REV="$(git rev-parse HEAD)"
+
+          EXCEL_FILE="agent_tracker/market_lens_agent_portfolio_budget_100k.xlsx"
+          RESULTS_DIR="agent_results"
+          TEMP_DIR="/tmp/market_lens_agent_generated"
+
+          echo "Saving changed Agent-generated files aside..."
+          python -m agent.generated_state_bundle save \
+            --bundle "$TEMP_DIR" \
+            --path "$EXCEL_FILE" \
+            --path "$RESULTS_DIR"
+
+          echo "Moving local repo to latest origin/main..."
+          git fetch origin main
+          python -m agent.persistence_guard "$BASE_REV" origin/main
+          git reset --hard origin/main
+          git clean -fd
+
+          echo "Restoring Agent-generated files on top of latest main..."
+          python -m agent.generated_state_bundle apply --bundle "$TEMP_DIR"
+          python -m agent.generated_state_bundle stage --bundle "$TEMP_DIR"
+
+          if git diff --cached --quiet; then
+            echo "No agent result changes to commit."
+            rm -f "${{ runner.temp }}/market-lens-buy-notifications.json"
+            echo "persisted=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "Update Market Lens paper agent results [skip render]"
+
+          echo "Pushing changes..."
+          if ! git push origin HEAD:main; then
+            echo "Push rejected because main changed. Retrying once on top of latest main..."
+
+            git fetch origin main
+            python -m agent.persistence_guard "$BASE_REV" origin/main
+            git reset --hard origin/main
+            git clean -fd
+
+            python -m agent.generated_state_bundle apply --bundle "$TEMP_DIR"
+            python -m agent.generated_state_bundle stage --bundle "$TEMP_DIR"
+
+            if git diff --cached --quiet; then
+              echo "No agent result changes to commit after retry."
+              rm -f "${{ runner.temp }}/market-lens-buy-notifications.json"
+              echo "persisted=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            git commit -m "Update Market Lens paper agent results [skip render]"
+            git push origin HEAD:main
+          fi
+          echo "persisted=true" >> "$GITHUB_OUTPUT"
+
+      - name: Send persisted BUY and setup notifications
+        if: steps.schedule_time.outputs.should_run == 'true' && steps.persist.outputs.persisted == 'true'
+        env:
+          MARKET_LENS_TELEGRAM_BOT_TOKEN: ${{ secrets.MARKET_LENS_TELEGRAM_BOT_TOKEN }}
+          MARKET_LENS_TELEGRAM_CHAT_ID: ${{ secrets.MARKET_LENS_TELEGRAM_CHAT_ID }}
+        run: python agent/send_buy_notifications.py "${{ runner.temp }}/market-lens-buy-notifications.json"
+
+      - name: Persist Telegram delivery receipts
+        if: always() && !cancelled() && steps.schedule_time.outputs.should_run == 'true' && steps.persist.outputs.persisted == 'true'
+        run: python agent/persist_notification_receipts.py
+
+      - name: Prepare scanner recovery bundle on failure
+        if: failure() && steps.schedule_time.outputs.should_run == 'true'
+        shell: bash
+        run: |
+          set +e
+          BUNDLE="$RUNNER_TEMP/market-lens-scanner-recovery"
+          FALLBACK="/tmp/market_lens_agent_generated"
+          rm -rf "$BUNDLE"
+          mkdir -p "$BUNDLE/agent_tracker" "$BUNDLE/agent_results"
+
+          copy_first_file() {
+            local relative="$1"
+            local destination="$BUNDLE/$relative"
+            for root in "$GITHUB_WORKSPACE" "$FALLBACK"; do
+              if [ -f "$root/$relative" ]; then
+                mkdir -p "$(dirname "$destination")"
+                cp "$root/$relative" "$destination"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          copy_first_file "agent_tracker/market_lens_agent_portfolio_budget_100k.xlsx" || true
+          copy_first_file "agent_results/dashboard_snapshot.json" || true
+
+          run_id="$(
+            for root in "$GITHUB_WORKSPACE" "$FALLBACK"; do
+              find "$root/agent_results/runtime" -maxdepth 1 -type f -name 'market_lens_agent_*.json' -printf '%f\n' 2>/dev/null
+            done | sort | tail -1 | sed -e 's/^market_lens_agent_//' -e 's/\.json$//'
+          )"
+          if [ -n "$run_id" ]; then
+            for relative in \
+              "agent_results/runtime/market_lens_agent_${run_id}.json" \
+              "agent_results/decisions/market_lens_agent_${run_id}.jsonl" \
+              "agent_results/summaries/market_lens_agent_${run_id}.md" \
+              "agent_results/screenshots/market_lens_agent_${run_id}.png"; do
+              copy_first_file "$relative" || true
+            done
+          fi
+
+          find "$BUNDLE" -type f -printf '%P (%s bytes)\n'
+
+      - name: Upload scanner recovery bundle
+        if: failure() && steps.schedule_time.outputs.should_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-lens-scanner-recovery-${{ github.run_id }}
+          path: ${{ runner.temp }}/market-lens-scanner-recovery
+          retention-days: 14
+          if-no-files-found: warn

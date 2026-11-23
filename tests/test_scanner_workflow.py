@@ -1,0 +1,74 @@
+from pathlib import Path
+
+import yaml
+
+
+WORKFLOW = Path(".github/workflows/market-lens-agent.yml")
+
+
+def test_scanner_workflow_is_valid_yaml() -> None:
+    payload = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    assert payload["jobs"]["run-agent"]["timeout-minutes"] == 30
+
+
+def test_scanner_refreshes_queued_workflow_to_latest_portfolio_before_scan() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+
+    refresh_index = text.index("- name: Refresh portfolio baseline")
+    scan_index = text.index("- name: Run Market Lens UI agent")
+    assert refresh_index < scan_index
+    assert "git fetch origin main" in text[refresh_index:scan_index]
+    assert "git reset --hard origin/main" in text[refresh_index:scan_index]
+
+
+def test_buy_notifications_are_sent_only_after_persistence() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+
+    run_index = text.index("- name: Run Market Lens UI agent")
+    persist_index = text.index("- name: Commit agent results safely")
+    notify_index = text.index("- name: Send persisted BUY and setup notifications")
+    receipt_index = text.index("- name: Persist Telegram delivery receipts")
+    assert run_index < persist_index < notify_index < receipt_index
+    run_block = text[run_index:persist_index]
+    assert "MARKET_LENS_AGENT_NOTIFICATION_OUTBOX" in run_block
+    assert 'MARKET_LENS_TELEGRAM_QUALIFIED_BLOCKED_ENABLED: "true"' in run_block
+    assert "MARKET_LENS_TELEGRAM_BOT_TOKEN" not in run_block
+    assert "steps.persist.outputs.persisted == 'true'" in text[notify_index:]
+
+
+def test_scanner_persists_generated_state_with_manifest_bundle() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    persist_index = text.index("- name: Commit agent results safely")
+    block = text[persist_index:]
+
+    assert "python -m agent.generated_state_bundle save" in block
+    assert "python -m agent.generated_state_bundle apply" in block
+    assert "python -m agent.generated_state_bundle stage" in block
+    assert 'git add "$EXCEL_FILE" "$RESULTS_DIR"' not in block
+
+
+def test_scanner_persists_bounded_market_regime_cache() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert "MARKET_LENS_REGIME_CACHE_PATH: agent_results/regime/market_regime_lkg.json" in text
+    assert 'MARKET_LENS_REGIME_LKG_MAX_SESSION_AGE: "3"' in text
+    assert '--path "$RESULTS_DIR"' in text
+
+
+def test_scanner_uses_bounded_focused_missing_ticker_recovery() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+
+    assert 'MARKET_LENS_AGENT_MISSING_RECOVERY_ENABLED: "true"' in text
+    assert 'MARKET_LENS_AGENT_MISSING_RECOVERY_MAX_TICKERS: "12"' in text
+    assert 'MARKET_LENS_AGENT_MISSING_RECOVERY_ROUNDS: "2"' in text
+    assert 'MARKET_LENS_AGENT_MISSING_RECOVERY_BATCH_SIZE: "4"' in text
+    assert 'MARKET_LENS_AGENT_MISSING_RECOVERY_MIN_REMAINING_SECONDS: "90"' in text
+    assert 'MARKET_LENS_AGENT_MISSING_RECOVERY_PAUSE_MS: "2000"' in text
+
+
+def test_scanner_compacts_large_workbook_before_github_warning_size() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+
+    assert 'MARKET_LENS_WORKBOOK_WATCHLIST_MAX_ROWS: "20000"' in text
+    assert 'MARKET_LENS_WORKBOOK_REWRITE_BYTES: "50000000"' in text
+    assert 'MARKET_LENS_WORKBOOK_WATCHLIST_MAX_ROWS: "80000"' not in text
+    assert 'MARKET_LENS_WORKBOOK_REWRITE_BYTES: "75000000"' not in text

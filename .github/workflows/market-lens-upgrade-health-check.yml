@@ -1,0 +1,47 @@
+name: Market Lens Operations Health Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_telegram:
+        description: Send one diagnostic message to the operations group only
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # Three lightweight weekday checks; freshness gates use New York local time.
+    - cron: "30 15,18,21 * * 1-5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: market-lens-operations-health
+  cancel-in-progress: false
+
+jobs:
+  health-check:
+    if: ${{ false }} # Host-side checks own production monitoring.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Check Hetzner production and notify operations group on failure
+        env:
+          MARKET_LENS_PUBLIC_URL: https://market-lens.2.28.100.77.sslip.io
+          MARKET_LENS_TELEGRAM_BOT_TOKEN: ${{ secrets.MARKET_LENS_TELEGRAM_BOT_TOKEN }}
+          MARKET_LENS_TELEGRAM_OPS_CHAT_ID: ${{ secrets.MARKET_LENS_TELEGRAM_OPS_CHAT_ID }}
+          TEST_TELEGRAM: ${{ inputs.test_telegram }}
+        shell: bash
+        run: |
+          if [ "$TEST_TELEGRAM" = "true" ]; then
+            python -m agent.ops_health_check --test-telegram
+          else
+            python -m agent.ops_health_check
+          fi

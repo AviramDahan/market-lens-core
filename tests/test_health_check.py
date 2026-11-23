@@ -1,0 +1,158 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from pathlib import Path
+
+from agent import health_check
+
+
+def test_int_from_scan_status_reads_completed_results() -> None:
+    assert health_check.int_from_scan_status("completed: 147 results") == 147
+    assert health_check.int_from_scan_status("failed") == 0
+
+
+def test_dashboard_payload_flags_fake_zero_scan() -> None:
+    payload = {
+        "latest_run": {
+            "timestamp": datetime.now(health_check.NEW_YORK_TZ).isoformat(timespec="seconds"),
+            "summary_text": "Run status: OK\nScan status: completed: 0 results\n",
+        }
+    }
+
+    checks = health_check.check_dashboard_payload(payload, max_scan_age_minutes=10, min_result_cards=1)
+
+    by_name = {check.name: check for check in checks}
+    assert by_name["Fake zero setup guard"].ok is False
+    assert by_name["Latest scan breadth"].ok is False
+
+
+def test_dashboard_payload_accepts_partial_scan_and_reports_coverage() -> None:
+    payload = {
+        "latest_run": {
+            "timestamp": datetime.now(health_check.NEW_YORK_TZ).isoformat(timespec="seconds"),
+            "run_status": "PARTIAL_OK",
+            "scan_status": "completed: 136 results; 3 unavailable",
+            "scan_complete": False,
+            "scan_coverage": {"requested": 139, "received": 136, "missing": 3},
+            "missing_tickers": ["ARM", "MMC", "RDDT"],
+            "summary_text": "Run status: PARTIAL_OK\nScan status: completed: 136 results; 3 unavailable\n",
+        }
+    }
+
+    checks = health_check.check_dashboard_payload(payload, max_scan_age_minutes=10, min_result_cards=100)
+
+    by_name = {check.name: check for check in checks}
+    assert by_name["Latest scan status"].ok is True
+    assert "coverage=136/139" in by_name["Latest scan status"].detail
+    assert "missing=3" in by_name["Latest scan status"].detail
+
+
+def test_latest_runtime_metrics_passes_for_recent_nonzero_file(monkeypatch, tmp_path: Path) -> None:
+    runtime_dir = tmp_path / "agent_results" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / "market_lens_agent_20260813_120000.json").write_text(
+        json.dumps({"total_seconds": 420.0, "result_cards_read": 150}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(health_check, "ROOT", tmp_path)
+
+    result = health_check.check_latest_runtime_metrics(max_runtime_seconds=1260)
+
+    assert result.ok is True
+    assert "result_cards=150" in result.detail
+
+
+def test_latest_runtime_metrics_fails_when_scan_runtime_is_too_high(monkeypatch, tmp_path: Path) -> None:
+    runtime_dir = tmp_path / "agent_results" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / "market_lens_agent_20260813_120000.json").write_text(
+        json.dumps({"total_seconds": 1300.0, "result_cards_read": 150}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(health_check, "ROOT", tmp_path)
+
+    result = health_check.check_latest_runtime_metrics(max_runtime_seconds=1260)
+
+    assert result.ok is False
+    assert "total_seconds=1300.0" in result.detail
+
+
+def test_latest_runtime_metrics_uses_timestamped_filename_order(monkeypatch, tmp_path: Path) -> None:
+    runtime_dir = tmp_path / "agent_results" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / "market_lens_agent_20260831_080000.json").write_text(
+        json.dumps({"total_seconds": 500.0, "result_cards_read": 164}),
+        encoding="utf-8",
+    )
+    (runtime_dir / "market_lens_agent_20260827_190000.json").write_text(
+        json.dumps({"total_seconds": 450.0, "result_cards_read": 155}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(health_check, "ROOT", tmp_path)
+
+    result = health_check.check_latest_runtime_metrics(max_runtime_seconds=1260)
+
+    assert "market_lens_agent_20260831_080000.json" in result.detail
+    assert "result_cards=164" in result.detail
+
+
+def test_tracker_size_passes_below_limit(monkeypatch, tmp_path: Path) -> None:
+    tracker = tmp_path / "agent_tracker" / "market_lens_agent_portfolio_budget_100k.xlsx"
+    tracker.parent.mkdir(parents=True)
+    tracker.write_bytes(b"x" * 99)
+    monkeypatch.setattr(health_check, "ROOT", tmp_path)
+
+    result = health_check.check_tracker_size(max_bytes=100)
+
+    assert result.ok is True
+    assert "bytes=99" in result.detail
+
+
+def test_tracker_size_fails_at_limit(monkeypatch, tmp_path: Path) -> None:
+    tracker = tmp_path / "agent_tracker" / "market_lens_agent_portfolio_budget_100k.xlsx"
+    tracker.parent.mkdir(parents=True)
+    tracker.write_bytes(b"x" * 100)
+    monkeypatch.setattr(health_check, "ROOT", tmp_path)
+
+    result = health_check.check_tracker_size(max_bytes=100)
+
+    assert result.ok is False
+    assert "maximum=100" in result.detail
+
+
+def test_health_message_marks_failures() -> None:
+    message = health_check.format_health_message(
+        public_url="https://example.test",
+        checks=[
+            health_check.HealthCheck("Render /health", True, "HTTP 200"),
+            health_check.HealthCheck("Latest scan breadth", False, "result_cards=80"),
+        ],
+    )
+
+    assert "Market Lens Health Alert" in message
+    assert "Status: FAIL" in message
+    assert "Latest scan breadth" in message
+
+
+def test_health_telegram_is_disabled_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("MARKET_LENS_HEALTH_TELEGRAM_ENABLED", raising=False)
+
+    assert health_check.health_telegram_enabled() is False
+
+
+def test_health_telegram_can_be_enabled_explicitly(monkeypatch) -> None:
+    monkeypatch.setenv("MARKET_LENS_HEALTH_TELEGRAM_ENABLED", "true")
+
+    assert health_check.health_telegram_enabled() is True
+
+
+def test_timestamp_age_accepts_naive_utc_or_new_york_values(monkeypatch) -> None:
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 13, 21, 20, tzinfo=tz)
+
+    monkeypatch.setattr(health_check, "datetime", FixedDatetime)
+
+    assert health_check.timestamp_age_minutes("2026-08-13T21:10:00") == 10

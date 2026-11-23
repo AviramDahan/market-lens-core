@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Testing / linting caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Runtime-generated assets/cache
+charts/*.png
+.yfinance-cache/
+data/
+agent_runs/
+agent_archive/
+.agent_results_sync_state.json
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Production data belongs in persistent host storage and the private archive.
+/agent_results/
+/agent_tracker/
+/screenshots/
+/.runtime/
+/.codex/
+/results/

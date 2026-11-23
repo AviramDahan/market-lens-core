@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Market Lens Agent</title>
+    <link rel="stylesheet" href="/static/agent.css?v=20261022-runtime-health" />
+  </head>
+  <body>
+    <main class="agent-shell">
+      <header class="agent-topbar">
+        <div>
+          <p class="eyebrow">Market Lens</p>
+          <h1 class="section-title">
+            Agent Dashboard
+            <button class="section-help-button" type="button" data-section-help="dashboardOverview" aria-label="Explain Agent Dashboard">
+              <i data-lucide="circle-help"></i>
+            </button>
+          </h1>
+        </div>
+        <div class="top-actions">
+          <label class="date-control" title="View portfolio snapshot by date">
+            <span>Snapshot</span>
+            <input id="historyDate" type="date" />
+          </label>
+          <button id="latestSnapshot" class="icon-button secondary" type="button" title="Latest snapshot">
+            <i data-lucide="rotate-ccw"></i>
+            <span>Latest</span>
+          </button>
+          <a class="icon-button secondary" href="/" title="Scanner">
+            <i data-lucide="search"></i>
+            <span>Scanner</span>
+          </a>
+          <a id="trackerLink" class="icon-button primary" href="/agent/tracker" title="Download tracker">
+            <i data-lucide="download"></i>
+            <span>Tracker</span>
+          </a>
+        </div>
+      </header>
+
+      <nav class="dashboard-nav" aria-label="Dashboard sections">
+        <a href="#positionsOverviewPanel"><i data-lucide="briefcase-business"></i><span>Positions</span></a>
+        <a href="#setupsSection"><i data-lucide="radar"></i><span>Setups</span></a>
+        <a href="#performanceSection"><i data-lucide="chart-no-axes-combined"></i><span>Performance</span></a>
+      </nav>
+
+      <section class="run-strip">
+        <div>
+          <span class="label">Last run</span>
+          <strong id="lastRun">Loading</strong>
+        </div>
+        <div>
+          <span class="label">Run status</span>
+          <strong id="runStatus">Checking</strong>
+          <small id="runStatusMeta" hidden></small>
+        </div>
+        <div>
+          <span class="label">Tickers scanned</span>
+          <strong id="tickerCount">0</strong>
+          <small id="scanCoverageMeta">Waiting for scan coverage</small>
+        </div>
+        <div>
+          <span class="label">Technical setups</span>
+          <strong id="validSetups">0</strong>
+        </div>
+        <div>
+          <span class="label">Next scan</span>
+          <strong id="nextScan">Calculating</strong>
+          <small id="nextScanMeta">Israel time</small>
+        </div>
+        <div>
+          <span class="label">Next price sync</span>
+          <strong id="nextPriceSync">Waiting</strong>
+          <small id="nextPriceSyncMeta">Live positions</small>
+        </div>
+        <div>
+          <span class="label">Monitor trigger</span>
+          <strong id="monitorTriggerStatus">Idle</strong>
+          <small id="monitorTriggerMeta">Live TP/SL sensor</small>
+        </div>
+        <div>
+          <span class="label info-label">
+            Trade-ready
+            <span class="entry-rules">
+              <button class="entry-rules-button" type="button" aria-label="Entry checklist rules">
+                <i data-lucide="info"></i>
+              </button>
+              <span class="entry-rules-popover" role="tooltip">
+                <strong>Entry checklist</strong>
+                <span>Required before BUY_SIMULATED:</span>
+                <span>Technical setup detected and price is executable inside the buy zone.</span>
+                <span>Market is not BEAR.</span>
+                <span>Sector is not WEAK; STRONG sectors get a lighter Neutral-market R/R threshold.</span>
+                <span>Setup score meets the active floor: BULL 0.45, NEUTRAL 0.55, or NEUTRAL pilot 0.45 only in STRONG sectors.</span>
+                <span>Net R/R meets the active threshold: BULL 2.0x, NEUTRAL 2.5x, NEUTRAL + STRONG sector 2.2x, or NEUTRAL pilot 2.0x.</span>
+                <span>NEUTRAL pilot requires regular session, STRONG sector, passed entry confirmation, no earnings blackout, half-size position, and max one pilot trade per day.</span>
+                <span>Target 1 must pass the active minimum net R/R and ATR-distance gates. Target 2 cannot justify entry alone.</span>
+                <span>Fib/support entries need a completed close above the buy zone or a strong bullish reclaim from the zone.</span>
+                <span>No earnings blackout, no excessive sector/factor exposure, and no high correlation warning.</span>
+                <span>Position sizing fits cash, exposure, and risk limits.</span>
+              </span>
+            </span>
+          </span>
+          <strong id="tradeReadySetups">0</strong>
+        </div>
+      </section>
+
+      <p id="runtimeHealthAlert" class="runtime-alert" role="status" hidden></p>
+      <section class="panel positions-overview-panel section-anchor" id="positionsOverviewPanel">
+        <div class="panel-head">
+          <div>
+            <h2 class="section-title">
+              Open Positions
+              <button class="section-help-button" type="button" data-section-help="openPositions" aria-label="Explain Open Positions">
+                <i data-lucide="circle-help"></i>
+              </button>
+            </h2>
+            <p id="positionsOverviewMeta">Quick view</p>
+          </div>
+        </div>
+        <div id="positionExecutionHealth" class="position-execution-health" aria-label="Position monitoring status"></div>
+        <div id="positionsOverview" class="positions-overview"></div>
+      </section>
+
+      <section class="panel position-attention-panel" id="positionAttentionPanel">
+        <div class="panel-head">
+          <div>
+            <h2 class="section-title">
+              Position Attention
+              <button class="section-help-button" type="button" data-section-help="positionAttention" aria-label="Explain Position Attention">
+                <i data-lucide="circle-help"></i>
+              </button>
+            </h2>
+            <p id="positionAttentionMeta">Nearest TP/SL events</p>
+          </div>
+        </div>
+        <div id="positionAttentionList" class="position-attention-list"></div>
+      </section>
+
+      <section class="metric-grid" id="metricGrid" aria-label="Portfolio summary"></section>
+
+      <section class="panel risk-dashboard-panel" id="riskDashboardPanel">
+        <div class="panel-head">
+          <div>
+            <h2 class="section-title">
+              Risk Dashboard
+              <button class="section-help-button" type="button" data-section-help="riskDashboard" aria-label="Explain Risk Dashboard">
+                <i data-lucide="circle-help"></i>
+              </button>
+            </h2>
+            <p id="riskDashboardMeta">Exposure, cash, risk and concentration</p>
+          </div>
+        </div>
+        <div id="riskDashboardGrid" class="risk-dashboard-grid"></div>
+      </section>
+
+      <section class="panel position-timeline-panel" id="positionTimelinePanel">
+        <div class="panel-head">
+          <div>
+            <h2 class="section-title">
+              Position Timeline
+              <button class="section-help-button" type="button" data-section-help="positionTimeline" aria-label="Explain Position Timeline">
+                <i data-lucide="circle-help"></i>
+              </button>
+            </h2>
+            <p id="positionTimelineMeta">Trade lifecycle for open positions</p>
+          </div>
+          <button class="icon-button secondary collapse-toggle" type="button" data-collapse-key="positionTimeline" data-collapse-target="positionTimelineContent" data-show-label="Show timeline" data-hide-label="Hide timeline" aria-expanded="false">
+            <i data-lucide="chevron-down"></i>
+            <span>Show</span>
+          </button>
+        </div>
+        <div id="positionTimelineContent" class="collapsible-content" hidden>
+          <div id="positionTimelineList" class="position-timeline-list"></div>
+        </div>
+      </section>
+
+      <section class="panel watch-ready-panel section-anchor" id="setupsSection">
+        <div class="panel-head">
+          <div>
+            <h2 class="section-title">
+              WATCH_READY
+              <button class="section-help-button" type="button" data-section-help="watchReady" aria-label="Explain WATCH_READY">
+                <i data-lucide="circle-help"></i>
+              </button>
+            </h2>
+            <p id="watchReadyMeta">Candidates staged for confirmation</p>
+          </div>
+          <button id="openWatchReadyDiagnostics" class="icon-button secondary" type="button">
+            <i data-lucide="list-filter"></i>
+            <span>Review all</span>
+          </button>
+        </div>
+        <div id="watchReadyList" class="watch-ready-list"></div>
+      </section>
+
+      <section class="panel diagnostics-panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="section-title">
+              Entry Diagnostics
+              <button class="section-help-button" type="button" data-section-help="entryDiagnostics" aria-label="Explain Entry Diagnostics">
+                <i data-lucide="circle-help"></i>
+              </button>
+            </h2>
+            <p id="diagnosticsMeta">Why setups did or did not enter</p>
+          </div>
+          <button class="icon-button secondary collapse-toggle" type="button" data-collapse-key="diagnosticsDetail" data-collapse-target="diagnosticsDetailPanel" data-show-label="Show analysis" data-hide-label="Hide analysis" aria-expanded="false">
+            <i data-lucide="chevron-down"></i>
+            <span>Show analysis</span>
+          </button>
+        </div>
+        <div id="diagnosticsGrid" class="diagnostics-grid"></div>
+        <div id="diagnosticsDetailPanel" class="collapsible-content diagnostics-detail" hidden>
+          <div id="whyNoBuysGrid" class="why-no-buys-grid"></div>
+          <div id="entryBlockersGrid" class="entry-blockers-grid"></div>
+          <div id="watchReadyFunnel" class="watch-funnel"></div>
+          <div id="conversionGrid" class="conversion-grid"></div>
+          <div class="near-miss-wrap">
+            <div class="near-miss-head">
+              <strong>Nearest missed entries</strong>
+              <div class="panel-actions">
+                <span id="nearMissMeta">Waiting for scan data</span>
+                <button class="icon-button secondary collapse-toggle" type="button" data-collapse-key="nearMisses" data-collapse-target="nearMissPanel" aria-expanded="false">
+                  <i data-lucide="chevron-down"></i>
+                  <span>Show</span>
+                </button>
+              </div>
+            </div>
+            <div id="nearMissPanel" class="collapsible-content" hidden>
+              <div id="nearMissList" class="near-miss-list"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="agent-layout section-anchor" id="performanceSection">
+        <div class="panel wide">
+          <div class="panel-head">
+            <div>
+              <h2 class="section-title">
+                Portfolio Equity
+                <button class="section-help-button" type="button" data-section-help="portfolioEquity" aria-label="Explain Portfolio Equity">
+                  <i data-lucide="circle-help"></i>
+                </button>
+              </h2>
+              <p id="equityMeta">Waiting for data</p>
+            </div>
+            <div class="panel-actions">
+              <span id="pnlBadge" class="badge neutral">0.00%</span>
+              <button class="icon-button secondary collapse-toggle" type="button" data-collapse-key="equity" data-collapse-target="equityChartPanel" aria-expanded="false">
+                <i data-lucide="chevron-down"></i>
+                <span>Show</span>
+              </button>
+            </div>
+          </div>
+          <div id="equityChartPanel" class="collapsible-content" hidden>
+            <canvas id="equityChart" height="260"></canvas>
+          </div>
+          <p id="executionReviewNotice" class="execution-review" role="status" hidden></p>
+        </div>
+
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="section-title">
+              Position Charts
+              <button class="section-help-button" type="button" data-section-help="positionCharts" aria-label="Explain Position Charts">
+                <i data-lucide="circle-help"></i>
+              </button>
+            </h2>
+            <p id="positionChartsMeta">Charts and selection context</p>
+          </div>
+          <button class="icon-button secondary collapse-toggle" type="button" data-collapse-key="positionCharts" data-collapse-target="positionChartsPanel" aria-expanded="false">
+            <i data-lucide="chevron-down"></i>
+            <span>Show</span>
+          </button>
+        </div>
+        <div id="positionChartsPanel" class="collapsible-content" hidden>
+          <div id="positionChartsGrid" class="position-chart-grid"></div>
+        </div>
+      </section>
+
+      <section class="agent-layout lower">
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <h2 class="section-title">
+                Latest Actions
+                <button class="section-help-button" type="button" data-section-help="latestActions" aria-label="Explain Latest Actions">
+                  <i data-lucide="circle-help"></i>
+                </button>
+              </h2>
+              <p id="actionMeta">Last scan decisions</p>
+            </div>
+            <button id="toggleActions" class="icon-button secondary" type="button" aria-expanded="false">
+              <i data-lucide="chevron-down"></i>
+              <span>Show</span>
+            </button>
+          </div>
+          <div id="actionsList" class="actions-list"></div>
+          <div id="actionsLoadMoreRow" class="load-more-row" hidden>
+            <button id="loadMoreActions" class="icon-button secondary" type="button">
+              <i data-lucide="list-plus"></i>
+              <span>Load more</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <h2 class="section-title">
+                Trade Log
+                <button class="section-help-button" type="button" data-section-help="tradeLog" aria-label="Explain Trade Log">
+                  <i data-lucide="circle-help"></i>
+                </button>
+              </h2>
+              <p id="tradeMeta">Recent agent trades</p>
+            </div>
+            <button id="toggleTrades" class="icon-button secondary" type="button" aria-expanded="false">
+              <i data-lucide="chevron-down"></i>
+              <span>Show</span>
+            </button>
+          </div>
+          <div id="tradeList" class="trade-list"></div>
+          <div id="tradesLoadMoreRow" class="load-more-row" hidden>
+            <button id="loadMoreTrades" class="icon-button secondary" type="button">
+              <i data-lucide="list-plus"></i>
+              <span>Load more</span>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="section-title">
+              Score Calibration
+              <button class="section-help-button" type="button" data-section-help="scoreCalibration" aria-label="Explain Score Calibration">
+                <i data-lucide="circle-help"></i>
+              </button>
+            </h2>
+            <p id="calibrationMeta">Closed trades by setup score bucket</p>
+          </div>
+          <button class="icon-button secondary collapse-toggle" type="button" data-collapse-key="scoreCalibration" data-collapse-target="calibrationPanel" aria-expanded="false">
+            <i data-lucide="chevron-down"></i>
+            <span>Show</span>
+          </button>
+        </div>
+        <div id="calibrationPanel" class="collapsible-content" hidden>
+          <div id="calibrationList" class="calibration-list"></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="section-title">
+              Latest Summary
+              <button class="section-help-button" type="button" data-section-help="latestSummary" aria-label="Explain Latest Summary">
+                <i data-lucide="circle-help"></i>
+              </button>
+            </h2>
+            <p id="summaryMeta">Agent written update</p>
+          </div>
+          <button class="icon-button secondary collapse-toggle" type="button" data-collapse-key="latestSummary" data-collapse-target="latestSummaryPanel" aria-expanded="false">
+            <i data-lucide="chevron-down"></i>
+            <span>Show</span>
+          </button>
+        </div>
+        <div id="latestSummaryPanel" class="collapsible-content" hidden>
+          <pre id="summaryText" class="summary-text">Loading</pre>
+        </div>
+      </section>
+
+    </main>
+
+    <div id="mediaModal" class="media-modal" aria-hidden="true">
+      <button id="mediaModalClose" class="media-close" type="button" title="Close">
+        <i data-lucide="x"></i>
+      </button>
+      <img id="mediaModalImage" alt="Expanded chart" />
+    </div>
+
+    <div id="diagnosticModal" class="diagnostic-modal" aria-hidden="true">
+      <div class="diagnostic-modal-panel" role="dialog" aria-modal="true" aria-labelledby="diagnosticModalTitle">
+        <div class="diagnostic-modal-head">
+          <div>
+            <span id="diagnosticModalEyebrow">Entry Diagnostics</span>
+            <h2 id="diagnosticModalTitle">Setup details</h2>
+            <p id="diagnosticModalMeta">Waiting for data</p>
+          </div>
+          <button id="diagnosticModalClose" class="icon-only" type="button" title="Close">
+            <i data-lucide="x"></i>
+          </button>
+        </div>
+        <div id="diagnosticFilters" class="diagnostic-filters">
+          <label>
+            <span>Sector</span>
+            <select id="diagnosticSectorFilter"></select>
+          </label>
+          <label>
+            <span>Setup</span>
+            <select id="diagnosticSetupFilter"></select>
+          </label>
+          <label>
+            <span>Chart</span>
+            <select id="diagnosticChartFilter">
+              <option value="all">All charts</option>
+              <option value="with_chart">With chart</option>
+              <option value="missing_chart">Missing chart</option>
+            </select>
+          </label>
+          <label>
+            <span>Confirm</span>
+            <select id="diagnosticConfirmationFilter">
+              <option value="all">All confirmation</option>
+              <option value="passed">Passed</option>
+              <option value="missing">Missing</option>
+            </select>
+          </label>
+          <label>
+            <span>Sort</span>
+            <select id="diagnosticSort">
+              <option value="closest">Closest to entry</option>
+              <option value="score">Best score</option>
+              <option value="rr">Best R/R</option>
+              <option value="ticker">Ticker A-Z</option>
+            </select>
+          </label>
+          <button id="diagnosticResetFilters" class="icon-button secondary" type="button">
+            <i data-lucide="rotate-ccw"></i>
+            <span>Reset</span>
+          </button>
+        </div>
+        <div id="diagnosticModalBody" class="diagnostic-modal-body"></div>
+        <div id="diagnosticLoadMoreRow" class="diagnostic-load-more-row" hidden>
+          <button id="loadMoreDiagnostics" class="icon-button secondary" type="button">
+            <i data-lucide="list-plus"></i>
+            <span>Load more</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div id="sectionHelpModal" class="section-help-modal" aria-hidden="true">
+      <div class="section-help-panel" role="dialog" aria-modal="true" aria-labelledby="sectionHelpTitle">
+        <div class="section-help-head">
+          <div>
+            <span id="sectionHelpEyebrow">Section guide</span>
+            <h2 id="sectionHelpTitle">Dashboard section</h2>
+          </div>
+          <button id="sectionHelpClose" class="icon-only" type="button" title="Close">
+            <i data-lucide="x"></i>
+          </button>
+        </div>
+        <div id="sectionHelpBody" class="section-help-body"></div>
+      </div>
+    </div>
+
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+    <script src="/static/agent.js?v=20261022-runtime-health"></script>
+  </body>
+</html>

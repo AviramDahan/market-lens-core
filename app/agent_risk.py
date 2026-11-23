@@ -1,0 +1,2764 @@
+from __future__ import annotations
+
+import math
+import os
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+
+from app.data import fetch_daily_frame, fetch_intraday_frame, fetch_next_earnings_date
+from app.indicators import compute_atr, session_vwap
+from app.entry_policy import breakout_continuation_profile
+from app.execution import position_metadata
+from app.policy_evidence import decision_policy_evidence
+from app.regime_evidence import (
+    cached_regime_state,
+    completed_regime_frame,
+    expected_completed_session,
+    load_regime_cache,
+    regime_cache_path,
+    save_regime_cache,
+    update_regime_cache,
+)
+from app.trading_clock import INTERVAL_MINUTES, bar_close_time, completed_frame, session_status
+from app.smart_universe import SECTOR_ETFS, build_sector_health, company_name_for
+
+
+MARKET_REGIME_SYMBOLS = {
+    "SPY": "SPY",
+    "QQQ": "QQQ",
+    "IWM": "IWM",
+    "VIX": "^VIX",
+    "US10Y": "^TNX",
+    "DXY": "DX-Y.NYB",
+}
+NY_TZ = ZoneInfo("America/New_York")
+
+
+@dataclass
+class MarketRegime:
+    label: str
+    score: float
+    max_total_exposure: float
+    minimum_net_rr: float
+    min_setup_score: float
+    reason: str
+    indicators: dict[str, Any] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+    risk_points: float = 0.0
+    exposure_limit_pct: float = 0.0
+    data_status: str = "HEALTHY"
+    allows_new_buys: bool = True
+    fallback_used: bool = False
+    freshness_coverage: dict[str, Any] = field(default_factory=dict)
+    data_quality_reason: str = "All market-regime inputs use the latest completed session."
+
+
+@dataclass
+class AgentRiskConfig:
+    starting_capital: float
+    default_max_total_exposure: float
+    max_position: float
+    analysis_period: str = "6mo"
+    bull_max_exposure: float | None = None
+    neutral_max_exposure: float | None = None
+    bear_max_exposure: float = 0.0
+    bull_min_net_rr: float = 2.0
+    neutral_min_net_rr: float = 2.5
+    bear_min_net_rr: float = 999.0
+    neutral_strong_sector_min_net_rr: float = 2.2
+    bull_min_setup_score: float = 0.45
+    neutral_min_setup_score: float = 0.55
+    sector_exposure_bull_pct: float = 0.40
+    sector_exposure_neutral_pct: float = 0.30
+    factor_exposure_bull_pct: float = 0.50
+    factor_exposure_neutral_pct: float = 0.35
+    correlation_block_threshold: float = 0.85
+    primary_rr_weight: float = 0.80
+    stretch_rr_weight: float = 0.20
+    minimum_primary_net_rr: float = 0.80
+    preferred_primary_net_rr: float = 1.00
+    minimum_target1_atr_distance: float = 0.75
+    require_entry_confirmation: bool = True
+    entry_confirmation_intraday_enabled: bool = True
+    entry_confirmation_intraday_interval: str = "30m"
+    entry_confirmation_intraday_period: str = "5d"
+    entry_confirmation_lookback_candles: int = 3
+    neutral_pilot_enabled: bool = True
+    neutral_pilot_min_setup_score: float = 0.45
+    neutral_pilot_min_net_rr: float = 2.0
+    neutral_pilot_position_pct: float = 0.50
+    neutral_pilot_max_trades_per_day: int = 2
+    stop_cooldown_days: int = 3
+    cooldown_exception_setup_score: float = 0.60
+    cooldown_exception_net_rr1: float = 1.20
+    earnings_blackout_before_days: int = 5
+    earnings_blackout_after_days: int = 1
+    block_unknown_earnings: bool = False
+    fees_per_share: float = 0.0
+    allow_off_hours_buys: bool = False
+    dynamic_exposure_enabled: bool = True
+    dynamic_exposure_max_pct: float = 0.60
+    cash_floor_pct: float = 0.40
+    base_trade_risk_pct: float = 0.005
+    high_quality_trade_risk_pct: float = 0.0075
+    portfolio_heat_limit_pct: float = 0.025
+
+    def __post_init__(self) -> None:
+        if self.bull_max_exposure is None:
+            self.bull_max_exposure = min(self.default_max_total_exposure, self.starting_capital * 0.40)
+        if self.neutral_max_exposure is None:
+            self.neutral_max_exposure = min(self.default_max_total_exposure, self.starting_capital * 0.20)
+        total_rr_weight = self.primary_rr_weight + self.stretch_rr_weight
+        if total_rr_weight <= 0:
+            self.primary_rr_weight = 0.80
+            self.stretch_rr_weight = 0.20
+        self.entry_confirmation_lookback_candles = max(1, int(self.entry_confirmation_lookback_candles or 1))
+        self.neutral_pilot_position_pct = min(max(float(self.neutral_pilot_position_pct or 0.0), 0.0), 1.0)
+        self.neutral_pilot_max_trades_per_day = max(0, int(self.neutral_pilot_max_trades_per_day or 0))
+        self.dynamic_exposure_max_pct = min(max(float(self.dynamic_exposure_max_pct), 0.0), 1.0)
+        self.cash_floor_pct = min(max(float(self.cash_floor_pct), 0.0), 1.0)
+        self.base_trade_risk_pct = min(max(float(self.base_trade_risk_pct), 0.0), 0.05)
+        self.high_quality_trade_risk_pct = min(
+            max(float(self.high_quality_trade_risk_pct), self.base_trade_risk_pct), 0.05
+        )
+        self.portfolio_heat_limit_pct = min(max(float(self.portfolio_heat_limit_pct), 0.0), 0.10)
+
+
+@dataclass
+class AgentRunRiskContext:
+    config: AgentRiskConfig
+    market_regime: MarketRegime
+    sector_health: dict[str, dict[str, Any]]
+    market_data_warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CandidateMarketSnapshot:
+    ticker: str
+    price: float = 0.0
+    atr: float = 0.0
+    atr_pct: float = 0.0
+    avg_dollar_volume: float = 0.0
+    return_1m: float = 0.0
+    return_3m: float = 0.0
+    market_cap: float = 0.0
+    market_cap_bucket: str = "Unknown"
+    bid: float = 0.0
+    ask: float = 0.0
+    normalized_momentum_score: float = 50.0
+    normalized_atr_score: float = 50.0
+    normalized_liquidity_score: float = 50.0
+    normalized_quality_score: float = 50.0
+    daily: pd.DataFrame | None = None
+    intraday: pd.DataFrame | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+def build_agent_run_context(
+    *,
+    analysis_period: str,
+    starting_capital: float,
+    default_max_total_exposure: float,
+    max_position: float,
+) -> AgentRunRiskContext:
+    config = AgentRiskConfig(
+        starting_capital=starting_capital,
+        default_max_total_exposure=default_max_total_exposure,
+        max_position=max_position,
+        analysis_period=analysis_period,
+        bull_min_setup_score=float(os.getenv("MARKET_LENS_BULL_MIN_SETUP_SCORE", "0.45")),
+        neutral_min_setup_score=float(os.getenv("MARKET_LENS_NEUTRAL_MIN_SETUP_SCORE", "0.55")),
+        correlation_block_threshold=float(os.getenv("MARKET_LENS_CORRELATION_BLOCK_THRESHOLD", "0.85")),
+        primary_rr_weight=float(os.getenv("MARKET_LENS_PRIMARY_RR_WEIGHT", "0.80")),
+        stretch_rr_weight=float(os.getenv("MARKET_LENS_STRETCH_RR_WEIGHT", "0.20")),
+        minimum_primary_net_rr=float(os.getenv("MARKET_LENS_MIN_PRIMARY_NET_RR", "0.80")),
+        preferred_primary_net_rr=float(os.getenv("MARKET_LENS_PREFERRED_PRIMARY_NET_RR", "1.00")),
+        minimum_target1_atr_distance=float(os.getenv("MARKET_LENS_MIN_TARGET1_ATR_DISTANCE", "0.75")),
+        require_entry_confirmation=os.getenv("MARKET_LENS_REQUIRE_ENTRY_CONFIRMATION", "true").lower()
+        in {"1", "true", "yes"},
+        entry_confirmation_intraday_enabled=os.getenv(
+            "MARKET_LENS_ENTRY_CONFIRMATION_INTRADAY_ENABLED", "true"
+        ).lower()
+        in {"1", "true", "yes"},
+        entry_confirmation_intraday_interval=os.getenv("MARKET_LENS_ENTRY_CONFIRMATION_INTRADAY_INTERVAL", "30m"),
+        entry_confirmation_intraday_period=os.getenv("MARKET_LENS_ENTRY_CONFIRMATION_INTRADAY_PERIOD", "5d"),
+        entry_confirmation_lookback_candles=int(
+            os.getenv("MARKET_LENS_ENTRY_CONFIRMATION_LOOKBACK_CANDLES", "3")
+        ),
+        neutral_pilot_enabled=os.getenv("MARKET_LENS_NEUTRAL_PILOT_ENABLED", "true").lower()
+        in {"1", "true", "yes"},
+        neutral_pilot_min_setup_score=float(os.getenv("MARKET_LENS_NEUTRAL_PILOT_MIN_SETUP_SCORE", "0.45")),
+        neutral_pilot_min_net_rr=float(os.getenv("MARKET_LENS_NEUTRAL_PILOT_MIN_NET_RR", "2.0")),
+        neutral_pilot_position_pct=float(os.getenv("MARKET_LENS_NEUTRAL_PILOT_POSITION_PCT", "0.50")),
+        neutral_pilot_max_trades_per_day=int(os.getenv("MARKET_LENS_NEUTRAL_PILOT_MAX_TRADES_PER_DAY", "2")),
+        stop_cooldown_days=int(os.getenv("MARKET_LENS_STOP_COOLDOWN_DAYS", "3")),
+        cooldown_exception_setup_score=float(
+            os.getenv("MARKET_LENS_COOLDOWN_EXCEPTION_SETUP_SCORE", "0.60")
+        ),
+        cooldown_exception_net_rr1=float(os.getenv("MARKET_LENS_COOLDOWN_EXCEPTION_NET_RR1", "1.20")),
+        block_unknown_earnings=os.getenv("MARKET_LENS_BLOCK_UNKNOWN_EARNINGS", "false").lower()
+        in {"1", "true", "yes"},
+        fees_per_share=float(os.getenv("MARKET_LENS_AGENT_FEES_PER_SHARE", "0")),
+        allow_off_hours_buys=os.getenv("MARKET_LENS_ALLOW_BUY_OUTSIDE_REGULAR_HOURS", "false").lower()
+        in {"1", "true", "yes"},
+        dynamic_exposure_enabled=os.getenv("MARKET_LENS_DYNAMIC_EXPOSURE_ENABLED", "true").lower()
+        in {"1", "true", "yes"},
+        dynamic_exposure_max_pct=float(os.getenv("MARKET_LENS_DYNAMIC_EXPOSURE_MAX_PCT", "0.60")),
+        cash_floor_pct=float(os.getenv("MARKET_LENS_CASH_FLOOR_PCT", "0.40")),
+        base_trade_risk_pct=float(os.getenv("MARKET_LENS_BASE_TRADE_RISK_PCT", "0.005")),
+        high_quality_trade_risk_pct=float(
+            os.getenv("MARKET_LENS_HIGH_QUALITY_TRADE_RISK_PCT", "0.0075")
+        ),
+        portfolio_heat_limit_pct=float(os.getenv("MARKET_LENS_PORTFOLIO_HEAT_LIMIT_PCT", "0.025")),
+    )
+    market_regime = assess_agent_market_regime(config)
+    try:
+        sector_health = build_sector_health(analysis_period)
+    except Exception:
+        sector_health = {}
+        market_regime.warnings.append("Sector health unavailable; using neutral fallback.")
+    return AgentRunRiskContext(config=config, market_regime=market_regime, sector_health=sector_health)
+
+
+def assess_agent_market_regime(
+    config: AgentRiskConfig, *, evaluated_at: datetime | None = None
+) -> MarketRegime:
+    indicators: dict[str, Any] = {}
+    warnings: list[str] = []
+    evaluated_at = evaluated_at or datetime.now(timezone.utc)
+    expected = expected_completed_session(evaluated_at)
+    expected_session = expected.isoformat() if expected else None
+    cache_path = regime_cache_path()
+    cache = load_regime_cache(cache_path)
+    cache_changed = False
+    max_cache_age = max(0, int(os.getenv("MARKET_LENS_REGIME_LKG_MAX_SESSION_AGE", "3")))
+
+    for label, symbol in MARKET_REGIME_SYMBOLS.items():
+        evidence: dict[str, Any] = {
+            "symbol": symbol,
+            "evaluated_at": evaluated_at.isoformat(),
+            "expected_completed_session": expected_session,
+            "freshness_status": "UNKNOWN",
+            "regime_data_source": "UNAVAILABLE",
+            "fallback_used": False,
+        }
+        try:
+            # Regime EMA200 needs its own warm-up, independent of chart range.
+            frame = fetch_daily_frame(symbol, period="2y")
+            completed, evidence = completed_regime_frame(frame, evaluated_at)
+            evidence["symbol"] = symbol
+            if evidence.get("provider_freshness_status") == "FUTURE_SESSION":
+                raise ValueError("provider returned a future daily session")
+            if evidence.get("freshness_status") != "LATEST_COMPLETED_SESSION":
+                raise ValueError(
+                    f"completed-session freshness is {evidence.get('freshness_status', 'UNKNOWN')}"
+                )
+            benchmark = benchmark_state(completed, is_vix=label == "VIX")
+            state = dict(benchmark)
+            state.update(evidence)
+            state["regime_data_source"] = "CURRENT_COMPLETED_SESSION"
+            state["fallback_used"] = False
+            indicators[label] = state
+            if expected_session:
+                update_regime_cache(cache, label, benchmark, expected_session, symbol)
+                cache_changed = True
+        except Exception as exc:
+            cached, cache_age = cached_regime_state(
+                cache,
+                label,
+                expected_session,
+                max_session_age=max_cache_age,
+            )
+            if cached is not None:
+                cached.update(evidence)
+                cached.update({
+                    "freshness_status": "LAST_KNOWN_GOOD",
+                    "regime_data_source": "LAST_KNOWN_GOOD",
+                    "fallback_used": True,
+                    "last_bar_session": cached.get("cached_session"),
+                    "fallback_session_age": cache_age,
+                    "fallback_reason": str(exc),
+                })
+                indicators[label] = cached
+                warnings.append(
+                    f"{label} uses last-known-good completed-session data "
+                    f"({cache_age} session(s) old): {exc}"
+                )
+            else:
+                evidence.update({
+                    "data_available": False,
+                    "fallback_session_age": cache_age,
+                    "fallback_reason": str(exc),
+                })
+                indicators[label] = evidence
+                warnings.append(f"{label} regime data unavailable with no valid fallback: {exc}")
+
+    if cache_changed and not save_regime_cache(cache_path, cache):
+        if cache_path is not None:
+            warnings.append("Market-regime last-known-good cache could not be saved.")
+
+    spy = indicators.get("SPY", {})
+    qqq = indicators.get("QQQ", {})
+    iwm = indicators.get("IWM", {})
+    vix = indicators.get("VIX", {})
+    us10y = indicators.get("US10Y", {})
+    dxy = indicators.get("DXY", {})
+
+    def usable(state: dict[str, Any]) -> bool:
+        return state.get("regime_data_source") in {"CURRENT_COMPLETED_SESSION", "LAST_KNOWN_GOOD"}
+
+    contributions = {
+        "SPY": (2 if trend_is_bullish(spy) else -2 if trend_is_bearish(spy) else 0) if usable(spy) else 0,
+        "QQQ": (2 if trend_is_bullish(qqq) else -2 if trend_is_bearish(qqq) else 0) if usable(qqq) else 0,
+        "IWM": (1 if not trend_is_bearish(iwm) else -1) if usable(iwm) else 0,
+        "VIX": (1 if vix_is_calm(vix) else -2 if vix_is_stressed(vix) else 0) if usable(vix) else 0,
+        "US10Y": (-0.5 if trend_is_bullish(us10y) else 0.25 if trend_is_bearish(us10y) else 0) if usable(us10y) else 0,
+        "DXY": (-0.25 if trend_is_bullish(dxy) else 0.25 if trend_is_bearish(dxy) else 0) if usable(dxy) else 0,
+    }
+    risk_points = float(sum(contributions.values()))
+    for label, state in indicators.items():
+        state["risk_point_contribution"] = contributions[label]
+
+    coverage = {
+        label: {
+            "available": bool(state.get("regime_data_source") != "UNAVAILABLE"),
+            "source": state.get("regime_data_source", "UNAVAILABLE"),
+            "freshness_status": state.get("freshness_status", "UNKNOWN"),
+            "session": state.get("last_bar_session") or state.get("expected_completed_session"),
+            "fallback_session_age": state.get("fallback_session_age"),
+        }
+        for label, state in indicators.items()
+    }
+    degraded_inputs = [label for label, item in coverage.items() if item["source"] != "CURRENT_COMPLETED_SESSION"]
+    unavailable_inputs = [label for label, item in coverage.items() if not item["available"]]
+    fallback_inputs = [label for label, item in coverage.items() if item["source"] == "LAST_KNOWN_GOOD"]
+    directional_missing = [label for label in ("SPY", "QQQ") if label in unavailable_inputs]
+    core_degraded = any(label in degraded_inputs for label in ("SPY", "QQQ", "VIX"))
+    data_status = "DEGRADED" if degraded_inputs else "HEALTHY"
+    allows_new_buys = not directional_missing
+    if directional_missing:
+        data_quality_reason = (
+            "New buys blocked because completed-session evidence is unavailable for "
+            + ", ".join(directional_missing)
+            + "."
+        )
+    elif core_degraded:
+        data_quality_reason = (
+            "Core regime evidence is degraded; bounded fallback or conservative neutral policy is active."
+        )
+    elif degraded_inputs:
+        data_quality_reason = (
+            "Optional regime inputs are incomplete; missing contributions are neutral and entry gates are unchanged."
+        )
+    else:
+        data_quality_reason = "All market-regime inputs use the latest completed session."
+
+    if risk_points >= 4:
+        label = "BULL"
+        score = 0.82
+        reason = "SPY/QQQ trend is constructive and volatility is acceptable."
+        max_exposure = float(config.bull_max_exposure or config.default_max_total_exposure)
+        min_rr = config.bull_min_net_rr
+        min_setup_score = config.bull_min_setup_score
+    elif risk_points <= -2:
+        label = "BEAR"
+        score = 0.22
+        reason = "Major-index trend or volatility profile is risk-off."
+        max_exposure = config.bear_max_exposure
+        min_rr = config.bear_min_net_rr
+        min_setup_score = 1.0
+    else:
+        label = "NEUTRAL"
+        score = 0.52
+        reason = "Market regime is mixed; use lower exposure and higher net R/R."
+        max_exposure = float(config.neutral_max_exposure or config.default_max_total_exposure)
+        min_rr = config.neutral_min_net_rr
+        min_setup_score = config.neutral_min_setup_score
+
+    if core_degraded and label == "BULL":
+        label = "NEUTRAL"
+        score = 0.52
+        reason = "Market evidence would be bullish, but incomplete core data requires a conservative neutral regime."
+        max_exposure = float(config.neutral_max_exposure or config.default_max_total_exposure)
+        min_rr = config.neutral_min_net_rr
+        min_setup_score = config.neutral_min_setup_score
+
+    exposure_pct = max_exposure / config.starting_capital if config.starting_capital else 0.0
+    if config.dynamic_exposure_enabled:
+        exposure_pct = dynamic_exposure_pct(
+            risk_points,
+            max_exposure_pct=min(config.dynamic_exposure_max_pct, 1.0 - config.cash_floor_pct),
+        )
+        max_exposure = config.starting_capital * exposure_pct
+    if core_degraded and label != "BEAR":
+        neutral_cap = float(config.neutral_max_exposure or config.default_max_total_exposure)
+        max_exposure = min(max_exposure, neutral_cap, config.starting_capital * 0.30)
+        exposure_pct = max_exposure / config.starting_capital if config.starting_capital else 0.0
+
+    return MarketRegime(
+        label=label,
+        score=score,
+        max_total_exposure=max_exposure,
+        minimum_net_rr=min_rr,
+        min_setup_score=min_setup_score,
+        reason=reason,
+        indicators=indicators,
+        warnings=warnings,
+        risk_points=round(risk_points, 2),
+        exposure_limit_pct=round(exposure_pct, 4),
+        data_status=data_status,
+        allows_new_buys=allows_new_buys,
+        fallback_used=bool(fallback_inputs),
+        freshness_coverage=coverage,
+        data_quality_reason=data_quality_reason,
+    )
+
+
+def dynamic_exposure_pct(risk_points: float, *, max_exposure_pct: float = 0.60) -> float:
+    """Map regime evidence continuously to exposure and avoid BULL/NEUTRAL cliffs."""
+    ceiling = min(max(float(max_exposure_pct), 0.0), 0.60)
+    points = float(risk_points)
+    if points <= -2.0:
+        return 0.0
+    if points <= 0.0:
+        value = 0.10 + ((points + 2.0) / 2.0) * 0.10
+    elif points <= 2.0:
+        value = 0.20 + (points / 2.0) * 0.10
+    elif points <= 4.0:
+        value = 0.30 + ((points - 2.0) / 2.0) * 0.15
+    else:
+        value = 0.45 + ((min(points, 6.0) - 4.0) / 2.0) * 0.15
+    return round(min(value, ceiling), 4)
+
+
+def benchmark_state(frame: pd.DataFrame, *, is_vix: bool = False) -> dict[str, Any]:
+    close = frame["Close"]
+    if len(close) < 200 or not all(math.isfinite(float(value)) and float(value) > 0 for value in close):
+        raise ValueError("EMA200 requires at least 200 valid positive daily closes")
+    price = float(close.iloc[-1])
+    ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
+    ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
+    ema200 = float(close.ewm(span=200, adjust=False).mean().iloc[-1])
+    ret_1m = pct_return(close, 21)
+    ret_3m = pct_return(close, 63)
+    trend = "bullish" if price > ema20 > ema50 and price > ema200 else "bearish" if price < ema50 else "mixed"
+    if is_vix:
+        trend = "calm" if price < 20 and price <= ema20 else "stressed" if price >= 25 or price > ema20 > ema50 else "mixed"
+    return {
+        "price": round(price, 4),
+        "ema20": round(ema20, 4),
+        "ema50": round(ema50, 4),
+        "ema200": round(ema200, 4),
+        "return_1m": round(ret_1m * 100, 2),
+        "return_3m": round(ret_3m * 100, 2),
+        "trend": trend,
+        "history_rows": len(close),
+        "ema200_span": 200,
+    }
+
+
+def evaluate_agent_candidate(
+    *,
+    timestamp: str,
+    result: Any,
+    initial_action: str,
+    initial_reason: str,
+    quantity: int,
+    cash_out: float,
+    risk_amount: float,
+    cash_available: float,
+    portfolio_exposure_before: float,
+    open_positions: dict[str, dict[str, Any]],
+    sector_map: dict[str, str],
+    run_context: AgentRunRiskContext,
+    portfolio_open_risk_before: float = 0.0,
+    recent_stop_events: dict[str, dict[str, Any]] | None = None,
+    neutral_pilot_trades_today: int = 0,
+    currency_rate: float = 1.0,
+    base_min_rr: float = 2.0,
+    preliminary_max_risk: float | None = None,
+    snapshot_cache: dict[str, CandidateMarketSnapshot] | None = None,
+) -> dict[str, Any]:
+    config = run_context.config
+    ticker = str(result.ticker).upper()
+    sector = sector_map.get(ticker, "Unknown")
+    sector_info = sector_regime_for(sector, run_context.sector_health)
+    # Caller owns this cache for one ticker's candidate-selection pass only.
+    # Portfolio sizing, gates and correlations are always evaluated again.
+    if snapshot_cache is not None and ticker in snapshot_cache:
+        snapshot = snapshot_cache[ticker]
+    else:
+        snapshot = build_candidate_snapshot(ticker, result.current_price, config)
+        if snapshot_cache is not None:
+            snapshot_cache[ticker] = snapshot
+    factor_tags = factor_tags_for(ticker, sector, snapshot.market_cap_bucket)
+    net_rr_info = calculate_net_rr(result, snapshot, config)
+    earnings_info = calculate_earnings_blackout(ticker, config)
+    target_info = validate_targets(result, snapshot, config)
+    confirmation = calculate_entry_confirmation(result, snapshot, config)
+    market_session = market_session_status(allow_off_hours_buys=config.allow_off_hours_buys)
+    confirmation_freshness = calculate_confirmation_freshness(
+        confirmation, market_session, lookback_candles=config.entry_confirmation_lookback_candles
+    )
+    technical_confirmation_passed = confirmation["entry_confirmation_passed"]
+    if (
+        config.require_entry_confirmation
+        and market_session["can_open_new_buy"]
+        and confirmation_freshness["status"] != "FRESH_SAME_SESSION"
+    ):
+        confirmation = {
+            **confirmation,
+            "entry_confirmation_passed": False,
+            "confirmation_status": "TIMING_INVALID",
+            "confirmation_reason": confirmation_freshness["reason"],
+        }
+    active_entry_profile = breakout_continuation_profile(
+        setup_type=result.setup_type, market_regime=run_context.market_regime.label,
+        sector_regime=sector_info["regime"], session=market_session,
+        confirmation=confirmation, freshness=confirmation_freshness,
+        net_rr_1=net_rr_info.get("net_rr_1"), earnings_blackout=earnings_info["earnings_blackout"],
+        minimum_primary_net_rr=config.minimum_primary_net_rr,
+    )
+    cooldown = cooldown_check(
+        ticker=ticker,
+        result=result,
+        net_rr_info=net_rr_info,
+        confirmation=confirmation,
+        recent_stop_events=recent_stop_events or {},
+        config=config,
+    )
+    normalized_quality_score = round(
+        (
+            snapshot.normalized_momentum_score * 0.45
+            + snapshot.normalized_atr_score * 0.25
+            + snapshot.normalized_liquidity_score * 0.30
+        ),
+        2,
+    )
+    neutral_pilot = neutral_pilot_status(
+        initial_action=initial_action,
+        result=result,
+        run_context=run_context,
+        sector_info=sector_info,
+        net_rr_info=net_rr_info,
+        earnings_info=earnings_info,
+        confirmation=confirmation,
+        market_session=market_session,
+        neutral_pilot_trades_today=neutral_pilot_trades_today,
+    )
+    # Price the actual paper entry using the same costs as the eligibility gate.
+    if initial_action == "BUY_SIMULATED" and quantity > 0:
+        cash_out = round(quantity * net_rr_info["net_entry"] * currency_rate, 2)
+        risk_amount = round(quantity * net_rr_info["net_risk_per_share"] * currency_rate, 2)
+    sizing_quantity = quantity
+    sizing_cash_out = cash_out
+    sizing_risk_amount = risk_amount
+    pilot_sizing = neutral_pilot_position_scale(
+        quantity=quantity,
+        cash_out=cash_out,
+        risk_amount=risk_amount,
+        position_pct=1.0,
+    )
+    if neutral_pilot["eligible"]:
+        pilot_sizing = neutral_pilot_position_scale(
+            quantity=quantity,
+            cash_out=cash_out,
+            risk_amount=risk_amount,
+            position_pct=config.neutral_pilot_position_pct,
+        )
+        sizing_quantity = pilot_sizing["quantity"]
+        sizing_cash_out = pilot_sizing["cash_out"]
+        sizing_risk_amount = pilot_sizing["risk_amount"]
+    capital_risk_budget = candidate_capital_risk_budget(
+        result=result,
+        sector_info=sector_info,
+        confirmation=confirmation,
+        entry_mode=neutral_pilot["entry_mode"],
+        config=config,
+    )
+    sizing = adjust_candidate_position_size(
+        ticker=ticker,
+        sector=sector,
+        factor_tags=factor_tags,
+        initial_action=initial_action,
+        quantity=sizing_quantity,
+        cash_out=sizing_cash_out,
+        risk_amount=sizing_risk_amount,
+        cash_available=cash_available,
+        portfolio_exposure_before=portfolio_exposure_before,
+        open_positions=open_positions,
+        sector_map=sector_map,
+        run_context=run_context,
+        portfolio_open_risk_before=portfolio_open_risk_before,
+        allowed_trade_risk=capital_risk_budget["risk_budget"],
+    )
+    effective_quantity = sizing["quantity"]
+    effective_cash_out = sizing["cash_out"]
+    effective_risk_amount = sizing["risk_amount"]
+    portfolio_exposure_after_if_buy = (
+        portfolio_exposure_before + effective_cash_out
+        if initial_action == "BUY_SIMULATED" and effective_quantity > 0
+        else portfolio_exposure_before
+    )
+    sector_exposure = sector_exposure_check(
+        ticker=ticker,
+        sector=sector,
+        initial_action=initial_action,
+        trade_cash_out=effective_cash_out,
+        open_positions=open_positions,
+        sector_map=sector_map,
+        run_context=run_context,
+    )
+    factor_exposure = factor_exposure_check(
+        ticker=ticker,
+        factor_tags=factor_tags,
+        initial_action=initial_action,
+        trade_cash_out=effective_cash_out,
+        open_positions=open_positions,
+        sector_map=sector_map,
+        run_context=run_context,
+    )
+    correlation = correlation_check(
+        ticker=ticker,
+        candidate_daily=snapshot.daily,
+        open_positions=open_positions,
+        analysis_period=config.analysis_period,
+        threshold=config.correlation_block_threshold,
+    )
+
+    warnings = []
+    warnings.extend(run_context.market_regime.warnings)
+    warnings.extend(snapshot.warnings)
+    warnings.extend(earnings_info["warnings"])
+    warnings.extend(target_info["warnings"])
+    warnings.extend(confirmation["warnings"])
+    warnings.extend(cooldown["warnings"])
+    warnings.extend(net_rr_info["warnings"])
+    warnings.extend(correlation["warnings"])
+    warnings.extend(sector_exposure["warnings"])
+    warnings.extend(factor_exposure["warnings"])
+    if sizing["adjusted"]:
+        warnings.append(sizing["reason"])
+    if pilot_sizing["adjusted"]:
+        warnings.append(pilot_sizing["reason"])
+    warnings.extend(neutral_pilot["warnings"])
+    if earnings_info["earnings_blackout"]:
+        warnings.append("Earnings blackout active.")
+
+    final_action = initial_action
+    final_reason = initial_reason
+    blockers: list[dict[str, str]] = []
+    capital_blockers: list[dict[str, str]] = []
+    entry_gate_blockers: list[dict[str, str]] = []
+    entry_qualified_before_capital = False
+    preliminary_capital_block = (
+        initial_action == "SKIP"
+        and initial_reason == "Position size blocked by cash, exposure, or risk limits."
+    )
+    if initial_action == "BUY_SIMULATED" or preliminary_capital_block:
+        base_minimum_net_rr = minimum_net_rr_for(run_context.market_regime, sector_info, config)
+        minimum_net_rr = config.neutral_pilot_min_net_rr if neutral_pilot["eligible"] else base_minimum_net_rr
+        minimum_setup_score = (
+            config.neutral_pilot_min_setup_score
+            if neutral_pilot["eligible"]
+            else run_context.market_regime.min_setup_score
+        )
+        blockers = buy_blockers(
+            result=result,
+            run_context=run_context,
+            sector_info=sector_info,
+            net_rr_info=net_rr_info,
+            earnings_info=earnings_info,
+            target_info=target_info,
+            confirmation=confirmation,
+            cooldown=cooldown,
+            sector_exposure=sector_exposure,
+            factor_exposure=factor_exposure,
+            correlation=correlation,
+            normalized_quality_score=normalized_quality_score,
+            portfolio_exposure_after=portfolio_exposure_after_if_buy,
+            sizing=sizing,
+            minimum_net_rr=minimum_net_rr,
+            minimum_setup_score=minimum_setup_score,
+            entry_mode=neutral_pilot["entry_mode"],
+            market_session=market_session,
+            active_entry_profile=active_entry_profile,
+        )
+        if blockers:
+            capital_blockers = [blocker for blocker in blockers if is_capital_blocker(blocker)]
+            entry_gate_blockers = [blocker for blocker in blockers if not is_capital_blocker(blocker)]
+            entry_qualified_before_capital = not entry_gate_blockers and bool(capital_blockers)
+            final_action = downgrade_action_from_blockers(blockers)
+            if entry_qualified_before_capital:
+                final_action = "WATCH"
+                final_reason = (
+                    "QUALIFIED_CAPITAL_BLOCKED: All active entry-quality gates passed, but "
+                    + capital_blockers[0]["reason"].removeprefix("WATCH: ")
+                )
+            else:
+                preferred_blockers = entry_gate_blockers or blockers
+                final_reason = blocker_reason_for_action(preferred_blockers, final_action)
+            warnings.extend(blocker["reason"] for blocker in blockers if blocker["reason"] != final_reason)
+        else:
+            entry_qualified_before_capital = True
+            if neutral_pilot["eligible"]:
+                final_reason = (
+                    f"BUY_SIMULATED: NEUTRAL_PILOT entry, STRONG sector, confirmation passed, "
+                    f"setup score {float(result.score or 0):.2f}, net R/R {net_rr_info['net_rr']:.2f}, "
+                    "pilot-sized position, no earnings blackout, correlation acceptable, and risk limits allow entry."
+                )
+            else:
+                final_reason = (
+                    f"BUY_SIMULATED: {run_context.market_regime.label} market regime, "
+                    f"{sector_info['regime']} sector, valid setup, net R/R {net_rr_info['net_rr']:.2f}, "
+                    "no earnings blackout, correlation acceptable, and risk limits allow entry."
+                )
+            if sizing["adjusted"]:
+                final_reason += f" Position size reduced to {effective_quantity} shares to fit exposure caps."
+            if correlation.get("status") in {"UNKNOWN", "PARTIAL"}:
+                final_reason = final_reason.replace("correlation acceptable", "correlation not fully verified (see warnings)")
+    elif initial_action == "WATCH":
+        final_reason = enrich_non_buy_reason("WATCH", initial_reason, run_context, sector_info, net_rr_info)
+    elif initial_action == "SKIP":
+        final_reason = enrich_non_buy_reason("SKIP", initial_reason, run_context, sector_info, net_rr_info)
+    elif initial_action == "HOLD":
+        if earnings_info["earnings_blackout"]:
+            final_reason = (
+                "HOLD: Existing simulated position remains open, but earnings blackout is active; "
+                "review the position before holding through earnings."
+            )
+        else:
+            final_reason = f"HOLD: Existing simulated position remains open. {run_context.market_regime.label} regime recorded."
+
+    if preliminary_capital_block:
+        # Zero-sized candidates never become buys through diagnostic evaluation.
+        # Sector/factor sizing was not evaluated at an executable quantity, so
+        # do not claim that every gate passed even if observed quality passed.
+        capital_blockers.append({"action": "SKIP", "reason": initial_reason})
+        entry_qualified_before_capital = False
+        final_action = "SKIP"
+        final_reason = "SKIP: " + (
+            entry_gate_blockers[0]["reason"] + " Also: " if entry_gate_blockers else ""
+        ) + initial_reason
+
+    portfolio_exposure_after = portfolio_exposure_after_if_buy if final_action == "BUY_SIMULATED" else portfolio_exposure_before
+    off_hours_initial_candidate = bool(
+        initial_action == "BUY_SIMULATED"
+        and not market_session["regular_session_open"]
+        and not config.allow_off_hours_buys
+    )
+    watch_status = (
+        "QUALIFIED_CAPITAL_BLOCKED"
+        if entry_qualified_before_capital and final_action != "BUY_SIMULATED"
+        else watch_status_for(final_action)
+    )
+    off_hours_candidate = bool(off_hours_initial_candidate and watch_status == "WATCH_READY")
+    setup_candidate_measurements = measure_setup_candidate_risk_evidence(
+        result=result,
+        snapshot=snapshot,
+        config=config,
+        market_session=market_session,
+        active_net_rr=net_rr_info,
+        active_target=target_info,
+        active_confirmation=confirmation,
+        active_confirmation_freshness=confirmation_freshness,
+    )
+    from app.execution import EXECUTION_VERSION, STRATEGY_VERSION
+    decision = {
+        **decision_policy_evidence(config, base_min_rr=base_min_rr,
+                                   preliminary_max_risk=preliminary_max_risk, currency_rate=currency_rate),
+        "strategy_version": STRATEGY_VERSION,
+        "execution_model_version": EXECUTION_VERSION,
+        "entry_signal_price": result.current_price,
+        "entry_execution_price": net_rr_info["net_entry"],
+        "execution_cost_policy": {
+            "half_spread_per_share": net_rr_info["estimated_spread"] / 2,
+            "slippage_per_share": net_rr_info["estimated_slippage"] / 2,
+            "fee_per_share": net_rr_info["estimated_fees"],
+        },
+        "entry_cost_per_share": round(net_rr_info["net_entry"] - result.current_price, 4),
+        "timestamp": timestamp,
+        "detector_diagnostics": list(getattr(result, "detector_diagnostics", None) or []),
+        "setup_detection_status": "PARTIAL" if getattr(result, "detector_diagnostics", None) else "COMPLETE",
+        "ticker": ticker,
+        "company_name": company_name_for(ticker),
+        "price": round(float(result.current_price or 0), 4),
+        "market_regime": run_context.market_regime.label,
+        "market_regime_score": run_context.market_regime.score,
+        "market_regime_risk_points": run_context.market_regime.risk_points,
+        "market_regime_reason": run_context.market_regime.reason,
+        "market_regime_data_status": run_context.market_regime.data_status,
+        "market_regime_allows_new_buys": run_context.market_regime.allows_new_buys,
+        "market_regime_fallback_used": run_context.market_regime.fallback_used,
+        "market_regime_freshness_coverage": run_context.market_regime.freshness_coverage,
+        "market_regime_data_quality_reason": run_context.market_regime.data_quality_reason,
+        "dynamic_exposure_enabled": config.dynamic_exposure_enabled,
+        "dynamic_exposure_limit_pct": run_context.market_regime.exposure_limit_pct,
+        "dynamic_exposure_limit": round(run_context.market_regime.max_total_exposure, 2),
+        "cash_floor_pct": config.cash_floor_pct,
+        "minimum_net_rr_required": (
+            config.neutral_pilot_min_net_rr
+            if neutral_pilot["eligible"]
+            else minimum_net_rr_for(run_context.market_regime, sector_info, config)
+        ),
+        "base_minimum_net_rr_required": minimum_net_rr_for(run_context.market_regime, sector_info, config),
+        "minimum_setup_score_required": (
+            config.neutral_pilot_min_setup_score
+            if neutral_pilot["eligible"]
+            else run_context.market_regime.min_setup_score
+        ),
+        "minimum_primary_net_rr_required": config.minimum_primary_net_rr,
+        "market_regime_indicators": run_context.market_regime.indicators,
+        "market_session_phase": market_session["phase"],
+        "market_session_timestamp": market_session["timestamp"],
+        "market_session_can_open_new_buy": market_session["can_open_new_buy"],
+        "market_session_reason": market_session["reason"],
+        "watch_status": watch_status,
+        "off_hours_entry_policy": "STAGE_ONLY" if off_hours_candidate else "REGULAR_SESSION_ONLY",
+        "off_hours_candidate": off_hours_candidate,
+        "regular_session_confirmation_required": off_hours_candidate,
+        "off_hours_staging_reason": (
+            "Off-hours candidate only: BUY_SIMULATED is blocked until a regular-session confirmation scan."
+            if off_hours_candidate
+            else ""
+        ),
+        "watch_review_reason": final_reason if watch_status == "WATCH_REVIEW" else "",
+        "entry_eligibility_status": (
+            "BUY_SIMULATED"
+            if final_action == "BUY_SIMULATED"
+            else "QUALIFIED_CAPITAL_BLOCKED"
+            if entry_qualified_before_capital
+            else "ENTRY_GATES_BLOCKED"
+            if initial_action == "BUY_SIMULATED" or (preliminary_capital_block and entry_gate_blockers)
+            else "CAPITAL_BLOCKED_UNASSESSED"
+            if preliminary_capital_block
+            else "TECHNICAL_CANDIDATE"
+        ),
+        "entry_qualified_before_capital": entry_qualified_before_capital,
+        "technical_entry_gates_passed": bool(
+            entry_qualified_before_capital
+            or (preliminary_capital_block and not entry_gate_blockers)
+        ),
+        "capital_blocked_only": bool(entry_qualified_before_capital and capital_blockers),
+        "entry_gate_blockers": [blocker["reason"] for blocker in entry_gate_blockers],
+        "capital_blockers": [blocker["reason"] for blocker in capital_blockers],
+        "sector": sector,
+        "sector_etf": sector_info["etf"],
+        "sector_regime": sector_info["regime"],
+        "sector_score": sector_info["score"],
+        "market_cap": snapshot.market_cap,
+        "market_cap_bucket": snapshot.market_cap_bucket,
+        "bid": snapshot.bid,
+        "ask": snapshot.ask,
+        "stock_score": round(float(result.score or 0), 4),
+        "normalized_momentum_score": snapshot.normalized_momentum_score,
+        "normalized_atr_score": snapshot.normalized_atr_score,
+        "normalized_liquidity_score": snapshot.normalized_liquidity_score,
+        "normalized_quality_score": normalized_quality_score,
+        "setup_type": result.setup_type,
+        "active_entry_profile": active_entry_profile,
+        "setup_score": round(float(result.score or 0), 4),
+        "setup_candidates": setup_candidate_measurements,
+        "buy_zone_low": result.buy_zone_low,
+        "buy_zone_high": result.buy_zone_high,
+        "stop_loss": result.stop_loss,
+        "target_1": result.target_1,
+        "target_2": result.target_2,
+        "target_1_atr_distance": target_info["target_1_atr_distance"],
+        "target_2_atr_distance": target_info["target_2_atr_distance"],
+        "target_feasibility_status": target_info["status"],
+        "market_structure_status": target_info["market_structure_status"],
+        "previous_resistance": target_info["previous_resistance"],
+        "prior_high_20": target_info["prior_high_20"],
+        "prior_high_63": target_info["prior_high_63"],
+        "confirmation_status": confirmation["confirmation_status"],
+        "confirmation_reason": confirmation["confirmation_reason"],
+        "trigger_level": confirmation["trigger_level"],
+        "close_above_trigger": confirmation["close_above_trigger"],
+        "vwap_reclaimed": confirmation["vwap_reclaimed"],
+        "retest_held": confirmation["retest_held"],
+        "entry_confirmation_passed": confirmation["entry_confirmation_passed"],
+        "technical_confirmation_passed": technical_confirmation_passed,
+        "confirmation_timing_valid": confirmation_freshness["status"] == "FRESH_SAME_SESSION",
+        "confirmation_timeframe": confirmation["confirmation_timeframe"],
+        "confirmation_vwap_reference": confirmation.get("confirmation_vwap_reference"),
+        "confirmation_vwap_price": confirmation.get("confirmation_vwap_price"),
+        "confirmation_candle_timestamp": confirmation["confirmation_candle_timestamp"],
+        "confirmation_lookback_candles": config.entry_confirmation_lookback_candles,
+        "confirmation_window_used": confirmation.get("confirmation_window_used", 1),
+        "confirmation_freshness_status": confirmation_freshness["status"],
+        "confirmation_age_minutes": confirmation_freshness["age_minutes"],
+        "confirmation_closed_age_minutes": confirmation_freshness.get("closed_age_minutes"),
+        "confirmation_same_session": confirmation_freshness["same_session"],
+        "confirmation_freshness_reason": confirmation_freshness["reason"],
+        "confirmation_freshness_shadow_only": False,
+        "confirmation_candle_close_timestamp": confirmation_freshness.get("close_timestamp"),
+        "entry_mode": neutral_pilot["entry_mode"],
+        "neutral_pilot_enabled": config.neutral_pilot_enabled,
+        "neutral_pilot_eligible": neutral_pilot["eligible"],
+        "neutral_pilot_reason": neutral_pilot["reason"],
+        "neutral_pilot_trades_today": neutral_pilot_trades_today,
+        "neutral_pilot_max_trades_per_day": config.neutral_pilot_max_trades_per_day,
+        "neutral_pilot_min_setup_score": config.neutral_pilot_min_setup_score,
+        "neutral_pilot_min_net_rr": config.neutral_pilot_min_net_rr,
+        "neutral_pilot_position_pct": config.neutral_pilot_position_pct,
+        "neutral_pilot_size_reduction_applied": pilot_sizing["adjusted"],
+        "gross_rr": net_rr_info["gross_rr"],
+        "gross_rr_1": net_rr_info["gross_rr_1"],
+        "gross_rr_2": net_rr_info["gross_rr_2"],
+        "gross_rr_decision": net_rr_info["gross_rr_decision"],
+        "theoretical_entry": net_rr_info["theoretical_entry"],
+        "executable_entry": net_rr_info["executable_entry"],
+        "gross_risk_per_share": net_rr_info["gross_risk_per_share"],
+        "gross_reward_1_per_share": net_rr_info["gross_reward_1_per_share"],
+        "gross_reward_2_per_share": net_rr_info["gross_reward_2_per_share"],
+        "estimated_spread": net_rr_info["estimated_spread"],
+        "estimated_slippage": net_rr_info["estimated_slippage"],
+        "estimated_fees": net_rr_info["estimated_fees"],
+        "spread_source": net_rr_info["spread_source"],
+        "execution_liquidity_bucket": net_rr_info["execution_liquidity_bucket"],
+        "net_entry": net_rr_info["net_entry"],
+        "net_stop_assumption": net_rr_info["net_stop_assumption"],
+        "net_target_1_assumption": net_rr_info["net_target_1_assumption"],
+        "net_target_2_assumption": net_rr_info["net_target_2_assumption"],
+        "net_risk_per_share": net_rr_info["net_risk_per_share"],
+        "net_reward_1_per_share": net_rr_info["net_reward_1_per_share"],
+        "net_reward_2_per_share": net_rr_info["net_reward_2_per_share"],
+        "net_rr_1": net_rr_info["net_rr_1"],
+        "net_rr_2": net_rr_info["net_rr_2"],
+        "net_rr": net_rr_info["net_rr"],
+        "earnings_date": earnings_info["earnings_date"],
+        "days_to_earnings": earnings_info["days_to_earnings"],
+        "earnings_blackout": earnings_info["earnings_blackout"],
+        "sector_exposure_before": sector_exposure["before"],
+        "sector_exposure_after": sector_exposure["after"],
+        "sector_exposure_cap": sector_exposure["cap"],
+        "sector_exposure_limit_exceeded": sector_exposure["limit_exceeded"],
+        "factor_tags": factor_tags,
+        "factor_exposure_before": factor_exposure["before"],
+        "factor_exposure_after": factor_exposure["after"],
+        "factor_exposure_cap": factor_exposure["cap"],
+        "factor_exposure_limit_exceeded": factor_exposure["limit_exceeded"],
+        "correlation_warning": correlation["correlation_warning"],
+        "correlation_status": correlation.get("status", "LEGACY_UNRECORDED"),
+        "correlation_positions_expected": correlation.get("positions_expected"),
+        "correlation_positions_checked": correlation.get("positions_checked"),
+        "correlation_missing_tickers": correlation.get("missing_tickers", []),
+        "highest_correlation_ticker": correlation["highest_correlation_ticker"],
+        "highest_correlation_value": correlation["highest_correlation_value"],
+        "cooldown_active": cooldown["cooldown_active"],
+        "last_stop_date": cooldown["last_stop_date"],
+        "cooldown_days_remaining": cooldown["cooldown_days_remaining"],
+        "cooldown_exception_used": cooldown["cooldown_exception_used"],
+        "cooldown_reason": cooldown["cooldown_reason"],
+        "position_size": effective_quantity if final_action == "BUY_SIMULATED" else 0,
+        "risk_amount": round(effective_risk_amount if final_action == "BUY_SIMULATED" else 0.0, 2),
+        "capital_quality_tier": capital_risk_budget["tier"],
+        "capital_quality_multiplier": capital_risk_budget["multiplier"],
+        "trade_risk_budget_pct": capital_risk_budget["risk_pct"],
+        "trade_risk_budget": round(capital_risk_budget["risk_budget"], 2),
+        "portfolio_heat_before": round(portfolio_open_risk_before, 2),
+        "portfolio_heat_after": round(
+            portfolio_open_risk_before
+            + (effective_risk_amount if final_action == "BUY_SIMULATED" else 0.0),
+            2,
+        ),
+        "portfolio_heat_cap": round(config.starting_capital * config.portfolio_heat_limit_pct, 2),
+        "portfolio_heat_pct": round(
+            portfolio_open_risk_before / config.starting_capital * 100
+            if config.starting_capital
+            else 0.0,
+            4,
+        ),
+        "cash_available": round(cash_available, 2),
+        "portfolio_exposure_before": round(portfolio_exposure_before, 2),
+        "portfolio_exposure_after": round(portfolio_exposure_after, 2),
+        "original_position_size": quantity,
+        "original_cash_out": round(cash_out, 2),
+        "original_risk_amount": round(risk_amount, 2),
+        "pre_cap_position_size": sizing_quantity,
+        "pre_cap_cash_out": round(sizing_cash_out, 2),
+        "pre_cap_risk_amount": round(sizing_risk_amount, 2),
+        "position_size_adjusted": sizing["adjusted"],
+        "adjusted_position_size": effective_quantity,
+        "adjusted_cash_out": round(effective_cash_out, 2),
+        "adjusted_risk_amount": round(effective_risk_amount, 2),
+        "sizing_adjustment_reason": sizing["reason"],
+        "position_sizing_explanation": position_sizing_explanation(
+            initial_action=initial_action,
+            final_action=final_action,
+            quantity=effective_quantity,
+            cash_out=effective_cash_out,
+            risk_amount=effective_risk_amount,
+            cash_available=cash_available,
+            portfolio_exposure_after=portfolio_exposure_after,
+            market_regime=run_context.market_regime,
+            sizing=sizing,
+        ),
+        "initial_action": initial_action,
+        "final_action": final_action,
+        "reason": final_reason,
+        "warnings": unique_strings(warnings),
+    }
+    if ticker in open_positions:
+        from app.execution import position_metadata
+        entry_metadata = position_metadata(open_positions[ticker])
+        for key in ("execution_model_version", "execution_cost_policy", "entry_signal_price",
+                    "entry_execution_price", "entry_cost_per_share", "strategy_version"):
+            decision.pop(key, None)
+            if key in entry_metadata:
+                decision[key] = entry_metadata[key]
+    decision["setup_alert_evidence"] = evaluate_setup_alert_quality(
+        result=result, run_context=run_context, sector_info=sector_info,
+        net_rr_info=net_rr_info, earnings_info=earnings_info, target_info=target_info,
+        confirmation=confirmation, market_session=market_session,
+        normalized_quality_score=normalized_quality_score, base_min_rr=base_min_rr,
+    )
+    return decision
+
+
+def evaluate_setup_alert_quality(
+    *, result, run_context, sector_info, net_rr_info, earnings_info, target_info,
+    confirmation, market_session, normalized_quality_score, base_min_rr=2.0,
+):
+    """Informational eligibility only. Never changes an action, size or portfolio.
+
+    BEAR's disabled-entry sentinel thresholds are replaced by the configured BULL
+    quality floors for this assessment only. Account exposure, sizing, correlation,
+    holdings, trade quotas and stop cooldown are intentionally absent.
+    """
+    config = run_context.config
+    regime = run_context.market_regime
+    if regime.label == "BEAR":
+        regime = replace(regime, label="BULL", minimum_net_rr=config.bull_min_net_rr,
+                         min_setup_score=config.bull_min_setup_score)
+    context = replace(run_context, market_regime=regime)
+    pilot = neutral_pilot_status(
+        initial_action="BUY_SIMULATED", result=result, run_context=context,
+        sector_info=sector_info, net_rr_info=net_rr_info, earnings_info=earnings_info,
+        confirmation=confirmation, market_session=market_session, neutral_pilot_trades_today=0,
+    )
+    score_floor = config.neutral_pilot_min_setup_score if pilot["eligible"] else regime.min_setup_score
+    rr_floor = config.neutral_pilot_min_net_rr if pilot["eligible"] else minimum_net_rr_for(regime, sector_info, config)
+    blockers = buy_blockers(
+        result=result, run_context=context, sector_info=sector_info, net_rr_info=net_rr_info,
+        earnings_info=earnings_info, target_info=target_info, confirmation=confirmation,
+        cooldown={"cooldown_active": False}, sector_exposure={"limit_exceeded": False},
+        factor_exposure={"limit_exceeded": False}, correlation={"correlation_warning": False},
+        normalized_quality_score=normalized_quality_score, portfolio_exposure_after=0,
+        sizing={"blocked": False}, minimum_net_rr=rr_floor, minimum_setup_score=score_floor,
+        entry_mode=pilot["entry_mode"], market_session=market_session,
+    )
+    reasons = [item["reason"] for item in blockers]
+    levels = [getattr(result, key, None) for key in
+              ("current_price", "buy_zone_low", "buy_zone_high", "stop_loss", "target_1", "target_2", "risk_reward", "score")]
+    numeric = all(isinstance(v, (int, float)) and math.isfinite(v) for v in levels)
+    if not numeric:
+        reasons.append("Missing or invalid setup levels.")
+    elif not (0 < result.stop_loss < result.current_price
+              and result.buy_zone_low <= result.current_price <= result.buy_zone_high
+              and result.current_price < result.target_1 <= result.target_2
+              and result.risk_reward >= base_min_rr):
+        reasons.append("Entry zone, stop, targets or gross R/R did not pass.")
+    if str(result.setup_type).upper().replace(" ", "_") in {"", "NO_TRADE", "NO-TRADE"}:
+        reasons.append("No technical setup.")
+    if regime.label not in {"BULL", "NEUTRAL"}:
+        reasons.append("Unknown market regime.")
+    if target_info.get("status") != "OK":
+        reasons.append("Target feasibility is not confirmed.")
+    if not all(math.isfinite(float(net_rr_info.get(key) or 0)) for key in ("net_rr", "net_rr_1", "net_rr_2")):
+        reasons.append("Invalid net R/R.")
+    if not math.isfinite(normalized_quality_score):
+        reasons.append("Invalid normalized quality score.")
+    freshness = calculate_confirmation_freshness(
+        confirmation, market_session, lookback_candles=config.entry_confirmation_lookback_candles)
+    if (not market_session.get("regular_session_open") or not confirmation.get("entry_confirmation_passed")
+            or freshness["status"] != "FRESH_SAME_SESSION"):
+        reasons.append("A fresh completed regular-session confirmation is required.")
+    return {"policy": "QUALITY_ONLY_SETUP_V1", "eligible": not reasons, "blockers": reasons,
+            "quality_reference_regime": regime.label, "minimum_setup_score": score_floor,
+            "minimum_net_rr": rr_floor, "market_regime_ignored": run_context.market_regime.label == "BEAR",
+            "portfolio_constraints_ignored": True}
+
+
+def measure_setup_candidate_risk_evidence(
+    *,
+    result: Any,
+    snapshot: CandidateMarketSnapshot,
+    config: AgentRiskConfig,
+    market_session: dict[str, Any],
+    active_net_rr: dict[str, Any],
+    active_target: dict[str, Any],
+    active_confirmation: dict[str, Any],
+    active_confirmation_freshness: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Measure every setup candidate against shared data without selecting it."""
+    measured: list[dict[str, Any]] = []
+    active_type = str(getattr(result, "setup_type", "") or "")
+    for candidate_index, payload in enumerate(getattr(result, "setup_candidates", None) or []):
+        if not isinstance(payload, dict):
+            continue
+        candidate = dict(payload)
+        candidate_type = str(candidate.get("setup_type") or "")
+        is_active = candidate_type == active_type
+        candidate_result = SimpleNamespace(
+            ticker=getattr(result, "ticker", ""),
+            setup_type=candidate_type,
+            score=float(
+                candidate.get("professional_adjusted_score")
+                if candidate.get("professional_adjusted_score") is not None
+                else candidate.get("legacy_score") or 0.0
+            ),
+            current_price=float(getattr(result, "current_price", 0.0) or 0.0),
+            buy_zone_low=candidate.get("buy_zone_low"),
+            buy_zone_high=candidate.get("buy_zone_high"),
+            stop_loss=candidate.get("stop_loss"),
+            target_1=candidate.get("target_1"),
+            target_2=candidate.get("target_2"),
+            risk_reward=float(candidate.get("risk_reward") or 0.0),
+        )
+        if is_active:
+            net_rr = active_net_rr
+            target = active_target
+            confirmation = active_confirmation
+            freshness = active_confirmation_freshness
+        else:
+            net_rr = calculate_net_rr(candidate_result, snapshot, config)
+            target = validate_targets(candidate_result, snapshot, config)
+            confirmation = calculate_entry_confirmation(candidate_result, snapshot, config)
+            freshness = calculate_confirmation_freshness(
+                confirmation,
+                market_session,
+                lookback_candles=config.entry_confirmation_lookback_candles,
+            )
+            if (
+                config.require_entry_confirmation
+                and market_session["can_open_new_buy"]
+                and freshness["status"] != "FRESH_SAME_SESSION"
+            ):
+                confirmation = {
+                    **confirmation,
+                    "entry_confirmation_passed": False,
+                    "confirmation_status": "TIMING_INVALID",
+                    "confirmation_reason": freshness["reason"],
+                }
+        candidate.update(
+            {
+                "candidate_risk_measurement_version": "setup_candidate_risk_v1",
+                "is_active_legacy_candidate": candidate.get(
+                    "is_active_legacy_candidate",
+                    candidate.get("selection_rank", candidate_index + 1) == 1,
+                ),
+                "is_selected_candidate": is_active,
+                "gross_rr_1": net_rr["gross_rr_1"],
+                "gross_rr_2": net_rr["gross_rr_2"],
+                "net_rr_1": net_rr["net_rr_1"],
+                "net_rr_2": net_rr["net_rr_2"],
+                "weighted_net_rr": net_rr["net_rr"],
+                "executable_entry": net_rr["executable_entry"],
+                "target_1_atr_distance": target["target_1_atr_distance"],
+                "target_2_atr_distance": target["target_2_atr_distance"],
+                "target_feasibility_status": target["status"],
+                "target_market_structure_status": target["market_structure_status"],
+                "entry_confirmation_status": confirmation["confirmation_status"],
+                "entry_confirmation_passed": confirmation["entry_confirmation_passed"],
+                "entry_confirmation_reason": confirmation["confirmation_reason"],
+                "confirmation_timeframe": confirmation["confirmation_timeframe"],
+                "confirmation_candle_timestamp": confirmation["confirmation_candle_timestamp"],
+                "confirmation_freshness_status": freshness["status"],
+                "confirmation_timing_valid": freshness["status"] == "FRESH_SAME_SESSION",
+            }
+        )
+        measured.append(candidate)
+    return measured
+
+
+def neutral_pilot_status(
+    *,
+    initial_action: str,
+    result: Any,
+    run_context: AgentRunRiskContext,
+    sector_info: dict[str, Any],
+    net_rr_info: dict[str, Any],
+    earnings_info: dict[str, Any],
+    confirmation: dict[str, Any],
+    market_session: dict[str, Any],
+    neutral_pilot_trades_today: int,
+) -> dict[str, Any]:
+    config = run_context.config
+    reasons: list[str] = []
+    warnings: list[str] = []
+    if not config.neutral_pilot_enabled:
+        reasons.append("Neutral pilot mode is disabled.")
+    if initial_action != "BUY_SIMULATED":
+        reasons.append("Base setup did not produce a candidate BUY before the risk layer.")
+    if run_context.market_regime.label != "NEUTRAL":
+        reasons.append("Neutral pilot only applies in a NEUTRAL market regime.")
+    if not market_session.get("regular_session_open"):
+        reasons.append("Neutral pilot only opens during the regular market session.")
+    if sector_info.get("regime") != "STRONG":
+        reasons.append("Neutral pilot requires a STRONG sector regime.")
+    if float(getattr(result, "score", 0) or 0) < config.neutral_pilot_min_setup_score:
+        reasons.append(
+            f"Setup score is below the neutral pilot floor "
+            f"({float(getattr(result, 'score', 0) or 0):.2f} < {config.neutral_pilot_min_setup_score:.2f})."
+        )
+    if float(net_rr_info.get("net_rr") or 0) < config.neutral_pilot_min_net_rr:
+        reasons.append(
+            f"Net R/R is below the neutral pilot floor "
+            f"({float(net_rr_info.get('net_rr') or 0):.2f} < {config.neutral_pilot_min_net_rr:.2f})."
+        )
+    if not confirmation.get("entry_confirmation_passed"):
+        reasons.append("Entry confirmation has not passed.")
+    if earnings_info.get("earnings_blackout"):
+        reasons.append("Earnings blackout is active.")
+    if (
+        config.neutral_pilot_max_trades_per_day > 0
+        and neutral_pilot_trades_today >= config.neutral_pilot_max_trades_per_day
+    ):
+        reasons.append(
+            f"Neutral pilot daily limit reached "
+            f"({neutral_pilot_trades_today}/{config.neutral_pilot_max_trades_per_day})."
+        )
+
+    eligible = not reasons
+    if eligible:
+        reason = (
+            "Neutral pilot eligible: regular session, STRONG sector, confirmation passed, "
+            f"setup score >= {config.neutral_pilot_min_setup_score:.2f}, "
+            f"net R/R >= {config.neutral_pilot_min_net_rr:.2f}."
+        )
+    else:
+        reason = " ".join(reasons)
+        if (
+            config.neutral_pilot_enabled
+            and initial_action == "BUY_SIMULATED"
+            and run_context.market_regime.label == "NEUTRAL"
+        ):
+            warnings.append(f"Neutral pilot not used: {reason}")
+    return {
+        "eligible": bool(eligible),
+        "entry_mode": "neutral_pilot" if eligible else "standard",
+        "reason": reason,
+        "warnings": warnings,
+    }
+
+
+def neutral_pilot_position_scale(
+    *,
+    quantity: int,
+    cash_out: float,
+    risk_amount: float,
+    position_pct: float,
+) -> dict[str, Any]:
+    position_pct = min(max(float(position_pct or 0.0), 0.0), 1.0)
+    original = {
+        "quantity": quantity,
+        "cash_out": cash_out,
+        "risk_amount": risk_amount,
+        "original_quantity": quantity,
+        "original_cash_out": cash_out,
+        "original_risk_amount": risk_amount,
+        "adjusted": False,
+        "reason": "",
+    }
+    if quantity <= 0 or cash_out <= 0 or position_pct >= 1.0:
+        return original
+    adjusted_quantity = max(1, math.floor(quantity * position_pct))
+    if adjusted_quantity >= quantity:
+        return original
+    scale = adjusted_quantity / quantity
+    return {
+        **original,
+        "quantity": adjusted_quantity,
+        "cash_out": round(cash_out * scale, 2),
+        "risk_amount": round(risk_amount * scale, 2),
+        "adjusted": True,
+        "reason": (
+            f"Neutral pilot position size reduced to {position_pct:.0%} "
+            f"({quantity} -> {adjusted_quantity} shares)."
+        ),
+    }
+
+
+def buy_blockers(
+    *,
+    result: Any,
+    run_context: AgentRunRiskContext,
+    sector_info: dict[str, Any],
+    net_rr_info: dict[str, Any],
+    earnings_info: dict[str, Any],
+    target_info: dict[str, Any],
+    confirmation: dict[str, Any],
+    cooldown: dict[str, Any],
+    sector_exposure: dict[str, Any],
+    factor_exposure: dict[str, Any],
+    correlation: dict[str, Any],
+    normalized_quality_score: float,
+    portfolio_exposure_after: float,
+    sizing: dict[str, Any],
+    minimum_net_rr: float,
+    minimum_setup_score: float | None = None,
+    entry_mode: str = "standard",
+    market_session: dict[str, Any] | None = None,
+    active_entry_profile: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    blockers: list[dict[str, str]] = []
+    if active_entry_profile and active_entry_profile.get("applicable") and not active_entry_profile.get("passed"):
+        # Keep the existing explicit WEAK-sector blocker as the single source
+        # for that failure, including read-only sector counterfactual analysis.
+        sector_only = (
+            active_entry_profile.get("blockers") == ["sector_regime"]
+            and sector_info.get("regime") == "WEAK"
+        )
+        if not sector_only:
+            action = "WATCH_READY" if active_entry_profile.get("staging_only") else "WATCH"
+            blockers.append({"action": action, "reason": action + ": " + active_entry_profile["reason"]})
+    regime = run_context.market_regime
+    session = market_session or market_session_status(
+        allow_off_hours_buys=run_context.config.allow_off_hours_buys
+    )
+    if not regime.allows_new_buys:
+        blockers.append({
+            "action": "SKIP",
+            "reason": f"SKIP: {regime.data_quality_reason}",
+        })
+    freshness = calculate_confirmation_freshness(
+        confirmation, session,
+        lookback_candles=run_context.config.entry_confirmation_lookback_candles,
+    )
+    if (
+        run_context.config.require_entry_confirmation
+        and session["can_open_new_buy"]
+        and freshness["status"] != "FRESH_SAME_SESSION"
+    ):
+        blockers.append({
+            "action": "WATCH",
+            "reason": f"WATCH: Entry confirmation timing invalid: {freshness['reason']}",
+        })
+    if sizing["blocked"]:
+        blockers.append({"action": "WATCH", "reason": f"WATCH: {sizing['reason']}"})
+    if session.get("phase") == "UNKNOWN":
+        blockers.append({
+            "action": "WATCH", "reason": f"WATCH: Session timing unavailable: {session['reason']}"
+        })
+    elif not session["can_open_new_buy"]:
+        blockers.append(
+            {
+                "action": "WATCH_READY",
+                "reason": (
+                    "WATCH_READY: Setup is staged outside regular market hours; "
+                    "re-scan after the regular session opens for entry confirmation."
+                ),
+            }
+        )
+    if regime.label == "BEAR":
+        blockers.append({"action": "SKIP", "reason": "SKIP: Bear market regime blocks new simulated buys."})
+    if portfolio_exposure_after > regime.max_total_exposure:
+        blockers.append(
+            {
+                "action": "WATCH",
+                "reason": (
+                    f"WATCH: Market regime exposure limit would be exceeded "
+                    f"({portfolio_exposure_after:.2f} > {regime.max_total_exposure:.2f})."
+                ),
+            }
+        )
+    score_floor = regime.min_setup_score if minimum_setup_score is None else minimum_setup_score
+    if regime.label in {"BULL", "NEUTRAL"} and float(result.score or 0) < score_floor:
+        score_label = "NEUTRAL pilot" if entry_mode == "neutral_pilot" else f"{regime.label} market"
+        blockers.append(
+            {
+                "action": "WATCH",
+                "reason": (
+                    f"WATCH: {score_label} requires setup score "
+                    f"({float(result.score or 0):.2f} < {score_floor:.2f})."
+                ),
+            }
+        )
+    if normalized_quality_score < 35:
+        blockers.append(
+            {
+                "action": "WATCH",
+                "reason": (
+                    f"WATCH: Normalized quality score is too low for a new entry "
+                    f"({normalized_quality_score:.2f}/100)."
+                ),
+            }
+        )
+    if regime.label == "NEUTRAL" and normalized_quality_score < 45:
+        blockers.append(
+            {
+                "action": "WATCH",
+                "reason": (
+                    f"WATCH: Neutral market requires stronger normalized quality "
+                    f"({normalized_quality_score:.2f}/100)."
+                ),
+            }
+        )
+    if sector_info["regime"] == "WEAK":
+        blockers.append(
+            {"action": "WATCH", "reason": "WATCH: Sector regime is WEAK; do not auto-buy weak sector setups."}
+        )
+    if sector_info["regime"] == "NEUTRAL" and float(result.score or 0) < 0.40:
+        blockers.append({"action": "WATCH", "reason": "WATCH: Neutral sector requires a cleaner setup score."})
+    if net_rr_info["net_rr_1"] < run_context.config.minimum_primary_net_rr:
+        blockers.append(
+            {
+                "action": "WATCH",
+                "reason": (
+                    f"WATCH: Target 1 net R/R {net_rr_info['net_rr_1']:.2f} "
+                    f"is below minimum {run_context.config.minimum_primary_net_rr:.2f}; "
+                    "Target 2 cannot justify the entry alone."
+                ),
+            }
+        )
+    if net_rr_info["net_rr"] < minimum_net_rr:
+        blockers.append(
+            {
+                "action": "WATCH_READY" if near_ready_net_rr(net_rr_info["net_rr"], minimum_net_rr) else "WATCH",
+                "reason": (
+                    f"Gross R/R is valid, but Net R/R {net_rr_info['net_rr']:.2f} "
+                    f"failed minimum {minimum_net_rr:.2f} after slippage/spread adjustment."
+                ),
+            }
+        )
+    if earnings_info["earnings_blackout"]:
+        blockers.append({"action": "SKIP", "reason": "SKIP: Earnings blackout active."})
+    if target_info["status"] == "INVALID":
+        blockers.append({"action": "SKIP", "reason": "SKIP: Target validation failed; target is not above price."})
+    if target_info["status"] == "EXTENDED":
+        blockers.append({"action": "WATCH", "reason": "WATCH: Target distance is extended versus daily ATR or market structure."})
+    if target_info["status"] == "LOW_REWARD_DISTANCE":
+        blockers.append({"action": "WATCH_READY", "reason": "Target 1 is too close versus daily ATR."})
+    if run_context.config.require_entry_confirmation and not confirmation["entry_confirmation_passed"]:
+        blockers.append(
+            {
+                "action": "WATCH",
+                "reason": f"WATCH: Entry confirmation failed - {confirmation['confirmation_reason']}",
+            }
+        )
+    if cooldown["cooldown_active"] and not cooldown["cooldown_exception_used"]:
+        blockers.append({"action": "WATCH", "reason": f"WATCH: {cooldown['cooldown_reason']}"})
+    if sector_exposure["limit_exceeded"]:
+        blockers.append(
+            {"action": "WATCH", "reason": "WATCH: Sector exposure limit would be exceeded by this trade."}
+        )
+    if factor_exposure["limit_exceeded"]:
+        blockers.append(
+            {"action": "WATCH", "reason": "WATCH: Factor/theme exposure limit would be exceeded by this trade."}
+        )
+    if correlation["correlation_warning"]:
+        blockers.append(
+            {
+                "action": "WATCH",
+                "reason": (
+                    f"WATCH: High correlation with existing position "
+                    f"{correlation['highest_correlation_ticker']}, "
+                    f"correlation {correlation['highest_correlation_value']:.2f}."
+                ),
+            }
+        )
+    return blockers
+
+
+def market_session_status(
+    now: datetime | None = None,
+    *,
+    allow_off_hours_buys: bool = False,
+) -> dict[str, Any]:
+    return session_status(now, allow_off_hours_buys=allow_off_hours_buys)
+
+
+def minimum_net_rr_for(
+    market_regime: MarketRegime,
+    sector_info: dict[str, Any],
+    config: AgentRiskConfig,
+) -> float:
+    if market_regime.label == "NEUTRAL" and sector_info.get("regime") == "STRONG":
+        return config.neutral_strong_sector_min_net_rr
+    return market_regime.minimum_net_rr
+
+
+def target_one_warning_only(*, net_rr_info: dict[str, Any], minimum_net_rr: float) -> bool:
+    return (
+        net_rr_info.get("net_rr", 0.0) >= minimum_net_rr
+        and net_rr_info.get("net_rr_2", 0.0) >= 2.0
+    )
+
+
+def near_ready_net_rr(net_rr: float, minimum_net_rr: float) -> bool:
+    return net_rr >= max(1.8, minimum_net_rr - 0.30)
+
+
+def watch_status_for(final_action: str) -> str:
+    action = str(final_action or "").upper()
+    if action == "WATCH_READY":
+        return "WATCH_READY"
+    if action == "WATCH":
+        return "WATCH_REVIEW"
+    return ""
+
+
+def calculate_confirmation_freshness(
+    confirmation: dict[str, Any],
+    market_session: dict[str, Any],
+    *,
+    lookback_candles: int = 3,
+) -> dict[str, Any]:
+    candle_value = str(confirmation.get("confirmation_candle_timestamp") or "").strip()
+    session_value = str(market_session.get("timestamp") or "").strip()
+    if not candle_value or not session_value:
+        return {
+            "status": "UNKNOWN",
+            "age_minutes": None,
+            "same_session": False,
+            "reason": "Confirmation timestamp unavailable; freshness is recorded as unknown.",
+        }
+    try:
+        candle = datetime.fromisoformat(candle_value.replace("Z", "+00:00"))
+        observed = datetime.fromisoformat(session_value.replace("Z", "+00:00"))
+        if observed.tzinfo is None:
+            raise ValueError("Observation timezone unavailable")
+        close_time = bar_close_time(candle, str(confirmation.get("confirmation_timeframe") or ""))
+        if candle.tzinfo is None:
+            candle = candle.replace(tzinfo=NY_TZ)
+    except Exception:
+        return {
+            "status": "UNKNOWN",
+            "age_minutes": None,
+            "same_session": False,
+            "reason": "Confirmation timestamp could not be parsed; freshness is recorded as unknown.",
+        }
+
+    candle_ny = candle.astimezone(NY_TZ)
+    observed_ny = observed.astimezone(NY_TZ)
+    age_minutes = (observed - close_time).total_seconds() / 60.0
+    same_session = candle_ny.date() == observed_ny.date()
+    if age_minutes < 0:
+        status = "INCOMPLETE_OR_FUTURE"
+        reason = "Confirmation candle has not closed at the observation time."
+    elif str(market_session.get("phase") or "").upper() != "REGULAR":
+        status = "OFF_HOURS_REFERENCE"
+        reason = "Completed regular-session candle is informational during off-hours staging."
+    elif same_session:
+        status = "FRESH_SAME_SESSION"
+        reason = "Confirmation uses a completed candle from the current regular session."
+        interval = str(confirmation.get("confirmation_timeframe") or "").removesuffix("_completed")
+        minutes = INTERVAL_MINUTES.get(interval)
+        if minutes and age_minutes >= minutes * max(1, lookback_candles):
+            status = "STALE_INTRADAY"
+            reason = "Confirmation is older than the configured completed-candle lookback window."
+    else:
+        status = "STALE_PREVIOUS_SESSION"
+        reason = "Confirmation uses a previous regular session; wait for a new completed confirmation."
+    return {
+        "status": status,
+        "age_minutes": round((observed - candle).total_seconds() / 60.0, 2),
+        "closed_age_minutes": round(age_minutes, 2),
+        "same_session": bool(same_session),
+        "reason": reason,
+        "close_timestamp": close_time.isoformat(),
+    }
+
+
+def downgrade_action_from_blockers(blockers: list[dict[str, str]]) -> str:
+    if any(blocker["action"] == "SKIP" for blocker in blockers):
+        return "SKIP"
+    if all(blocker["action"] == "WATCH_READY" for blocker in blockers):
+        return "WATCH_READY"
+    return "WATCH"
+
+
+def is_capital_blocker(blocker: dict[str, str]) -> bool:
+    reason = str(blocker.get("reason") or "").lower()
+    return any(
+        marker in reason
+        for marker in (
+            "position cannot be opened because",
+            "market regime exposure limit",
+            "sector exposure limit",
+            "factor/theme exposure limit",
+            "portfolio heat",
+            "trade risk budget",
+            "cash available",
+            "max position allocation",
+        )
+    )
+
+
+def blocker_reason_for_action(blockers: list[dict[str, str]], final_action: str) -> str:
+    for blocker in blockers:
+        if blocker["action"] == final_action:
+            return blocker["reason"]
+    return blockers[0]["reason"] if blockers else ""
+
+
+def enrich_non_buy_reason(
+    action: str,
+    initial_reason: str,
+    run_context: AgentRunRiskContext,
+    sector_info: dict[str, Any],
+    net_rr_info: dict[str, Any],
+) -> str:
+    return (
+        f"{action}: {initial_reason} Market regime {run_context.market_regime.label}; "
+        f"sector {sector_info['regime']}; net R/R {net_rr_info['net_rr']:.2f}."
+    )
+
+
+def position_sizing_explanation(
+    *,
+    initial_action: str,
+    final_action: str,
+    quantity: int,
+    cash_out: float,
+    risk_amount: float,
+    cash_available: float,
+    portfolio_exposure_after: float,
+    market_regime: MarketRegime,
+    sizing: dict[str, Any] | None = None,
+) -> str:
+    if initial_action != "BUY_SIMULATED":
+        return "No new position size was calculated because the base decision did not open a simulated buy."
+    if final_action != "BUY_SIMULATED":
+        return (
+            "Base position sizing produced a candidate trade, but the risk transparency layer "
+            f"blocked the new buy. Candidate size: {quantity} shares, cash {cash_out:.2f}, "
+            f"risk {risk_amount:.2f}."
+        )
+    if sizing and sizing.get("adjusted"):
+        return (
+            f"Position size reduced from {sizing.get('original_quantity')} to {quantity} shares. "
+            f"Accepted cash out {cash_out:.2f}, risk {risk_amount:.2f}. "
+            f"Reason: {sizing.get('reason')}"
+        )
+    return (
+        f"Position size accepted: {quantity} shares, cash out {cash_out:.2f}, "
+        f"risk {risk_amount:.2f}, cash available {cash_available:.2f}, "
+        f"portfolio exposure after trade {portfolio_exposure_after:.2f}, "
+        f"market-regime exposure cap {market_regime.max_total_exposure:.2f}."
+    )
+
+
+def sector_regime_for(sector: str, sector_health: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    item = sector_health.get(sector, {})
+    label = str(item.get("label") or "Neutral").upper()
+    if label not in {"STRONG", "NEUTRAL", "WEAK"}:
+        label = "NEUTRAL"
+    score = float(item.get("score", 55.0))
+    return {
+        "sector": sector,
+        "etf": item.get("etf") or SECTOR_ETFS.get(sector, "SPY"),
+        "regime": label,
+        "score": round(score, 2),
+        "reason": item.get("reason", "Sector regime fallback used."),
+    }
+
+
+def adjust_candidate_position_size(
+    *,
+    ticker: str,
+    sector: str,
+    factor_tags: list[str],
+    initial_action: str,
+    quantity: int,
+    cash_out: float,
+    risk_amount: float,
+    cash_available: float,
+    portfolio_exposure_before: float,
+    open_positions: dict[str, dict[str, Any]],
+    sector_map: dict[str, str],
+    run_context: AgentRunRiskContext,
+    portfolio_open_risk_before: float = 0.0,
+    allowed_trade_risk: float | None = None,
+) -> dict[str, Any]:
+    original = {
+        "quantity": quantity,
+        "cash_out": cash_out,
+        "risk_amount": risk_amount,
+        "original_quantity": quantity,
+        "original_cash_out": cash_out,
+        "original_risk_amount": risk_amount,
+        "adjusted": False,
+        "blocked": False,
+        "reason": "",
+    }
+    if initial_action != "BUY_SIMULATED" or quantity <= 0 or cash_out <= 0:
+        return original
+
+    per_share_cash = cash_out / quantity
+    per_share_risk = risk_amount / quantity if quantity else 0.0
+    caps = [
+        ("candidate size", float(quantity)),
+        ("max position allocation", run_context.config.max_position / per_share_cash),
+        ("cash available", max(0.0, cash_available) / per_share_cash),
+        (
+            "market regime exposure",
+            max(0.0, run_context.market_regime.max_total_exposure - portfolio_exposure_before)
+            / per_share_cash,
+        ),
+    ]
+
+    sector_before = current_sector_exposure(ticker, sector, open_positions, sector_map)
+    sector_cap = sector_exposure_cap(run_context)
+    caps.append(
+        (f"{sector} sector exposure", max(0.0, sector_cap - sector_before) / per_share_cash)
+    )
+
+    factor_before = current_factor_exposure(ticker, open_positions, sector_map)
+    factor_cap = factor_exposure_cap(run_context)
+    for tag in factor_tags:
+        caps.append(
+            (
+                f"{tag} factor exposure",
+                max(0.0, factor_cap - factor_before.get(tag, 0.0)) / per_share_cash,
+            )
+        )
+
+    portfolio_heat_cap = run_context.config.starting_capital * run_context.config.portfolio_heat_limit_pct
+    if per_share_risk > 0:
+        trade_risk_cap = (
+            float(allowed_trade_risk)
+            if allowed_trade_risk is not None
+            else run_context.config.starting_capital * run_context.config.base_trade_risk_pct
+        )
+        caps.append(("trade risk budget", max(0.0, trade_risk_cap) / per_share_risk))
+        caps.append(
+            (
+                "portfolio heat",
+                max(0.0, portfolio_heat_cap - portfolio_open_risk_before) / per_share_risk,
+            )
+        )
+
+    limiting_name, limiting_quantity = min(caps, key=lambda item: item[1])
+    adjusted_quantity = math.floor(max(0.0, limiting_quantity))
+    if adjusted_quantity <= 0:
+        return {
+            **original,
+            "quantity": 0,
+            "cash_out": 0.0,
+            "risk_amount": 0.0,
+            "adjusted": True,
+            "blocked": True,
+            "reason": f"Position cannot be opened because {limiting_name} cap leaves no executable size.",
+        }
+    if adjusted_quantity >= quantity:
+        return original
+
+    adjusted_cash = adjusted_quantity * per_share_cash
+    adjusted_risk = adjusted_quantity * per_share_risk
+    return {
+        **original,
+        "quantity": adjusted_quantity,
+        "cash_out": round(adjusted_cash, 2),
+        "risk_amount": round(adjusted_risk, 2),
+        "adjusted": True,
+        "blocked": False,
+        "reason": (
+            f"Position size reduced by {limiting_name} cap "
+            f"({quantity} -> {adjusted_quantity} shares)."
+        ),
+    }
+
+
+def candidate_capital_risk_budget(
+    *,
+    result: Any,
+    sector_info: dict[str, Any],
+    confirmation: dict[str, Any],
+    entry_mode: str,
+    config: AgentRiskConfig,
+) -> dict[str, Any]:
+    score = float(getattr(result, "score", 0.0) or 0.0)
+    confirmed = bool(confirmation.get("entry_confirmation_passed"))
+    strong_sector = str(sector_info.get("regime") or "").upper() == "STRONG"
+    if score >= 0.55 and confirmed and strong_sector and entry_mode != "neutral_pilot":
+        tier = "HIGH_QUALITY"
+        multiplier = 1.0
+        risk_pct = config.high_quality_trade_risk_pct
+    elif score >= 0.50 and confirmed and entry_mode != "neutral_pilot":
+        tier = "STANDARD_75"
+        multiplier = 0.75
+        risk_pct = config.base_trade_risk_pct * multiplier
+    else:
+        tier = "PILOT_50"
+        multiplier = 0.50
+        risk_pct = config.base_trade_risk_pct * multiplier
+    return {
+        "tier": tier,
+        "multiplier": multiplier,
+        "risk_pct": round(risk_pct, 6),
+        "risk_budget": round(config.starting_capital * risk_pct, 2),
+    }
+
+
+def build_candidate_snapshot(ticker: str, price: float, config: AgentRiskConfig) -> CandidateMarketSnapshot:
+    warnings: list[str] = []
+    daily = None
+    intraday = None
+    atr = 0.0
+    atr_pct = 0.0
+    avg_dollar_volume = 0.0
+    ret_1m = 0.0
+    ret_3m = 0.0
+    try:
+        daily = fetch_daily_frame(ticker, period=config.analysis_period)
+        close = daily["Close"]
+        price = float(close.iloc[-1]) if len(close) else price
+        atr = compute_atr(daily)
+        atr_pct = atr / price * 100 if price else 0.0
+        recent = daily.tail(20)
+        avg_dollar_volume = float((recent["Close"] * recent["Volume"]).mean())
+        ret_1m = pct_return(close, 21)
+        ret_3m = pct_return(close, 63)
+    except Exception as exc:
+        warnings.append(f"Candidate market data unavailable: {exc}")
+    if config.require_entry_confirmation and config.entry_confirmation_intraday_enabled:
+        try:
+            intraday = fetch_intraday_frame(
+                ticker,
+                period=config.entry_confirmation_intraday_period,
+                interval=config.entry_confirmation_intraday_interval,
+                include_prepost=False,
+            )
+        except Exception as exc:
+            warnings.append(f"Intraday entry confirmation data unavailable: {exc}")
+
+    market_profile = fetch_market_profile(ticker, warnings)
+    bucket = market_cap_bucket(market_profile["market_cap"])
+    return CandidateMarketSnapshot(
+        ticker=ticker,
+        price=round(price, 4),
+        atr=round(atr, 4),
+        atr_pct=round(atr_pct, 4),
+        avg_dollar_volume=round(avg_dollar_volume, 2),
+        return_1m=round(ret_1m, 4),
+        return_3m=round(ret_3m, 4),
+        market_cap=round(market_profile["market_cap"], 2),
+        market_cap_bucket=bucket,
+        bid=round(market_profile["bid"], 4),
+        ask=round(market_profile["ask"], 4),
+        normalized_momentum_score=normalized_momentum_score(ret_1m, ret_3m, bucket),
+        normalized_atr_score=normalized_atr_score(atr_pct, bucket),
+        normalized_liquidity_score=normalized_liquidity_score(avg_dollar_volume, bucket),
+        normalized_quality_score=50.0,
+        daily=daily,
+        intraday=intraday,
+        warnings=warnings,
+    )
+
+
+def fetch_market_profile(ticker: str, warnings: list[str]) -> dict[str, float]:
+    try:
+        import yfinance as yf
+
+        fast_info = yf.Ticker(ticker).fast_info
+        market_cap = getattr(fast_info, "market_cap", None)
+        bid = getattr(fast_info, "bid", None)
+        ask = getattr(fast_info, "ask", None)
+        if market_cap is None and isinstance(fast_info, dict):
+            market_cap = fast_info.get("marketCap") or fast_info.get("market_cap")
+            bid = fast_info.get("bid")
+            ask = fast_info.get("ask")
+        return {
+            "market_cap": float(market_cap or 0.0),
+            "bid": float(bid or 0.0),
+            "ask": float(ask or 0.0),
+        }
+    except Exception as exc:
+        warnings.append(f"Market profile unavailable: {exc}")
+        return {"market_cap": 0.0, "bid": 0.0, "ask": 0.0}
+
+
+def calculate_net_rr(result: Any, snapshot: CandidateMarketSnapshot, config: AgentRiskConfig) -> dict[str, Any]:
+    price = float(result.current_price or snapshot.price or 0.0)
+    entry_info = resolve_entry_info(result, price)
+    entry = entry_info["executable_entry"]
+    stop = float(result.stop_loss or 0.0)
+    target_1 = float(result.target_1 or 0.0)
+    target_2 = float(result.target_2 or 0.0)
+    gross_risk = max(0.0, entry - stop)
+    gross_reward_1 = max(0.0, target_1 - entry)
+    gross_reward_2 = max(0.0, target_2 - entry)
+    gross_rr_1 = gross_reward_1 / gross_risk if gross_risk > 0 else 0.0
+    gross_rr_2 = gross_reward_2 / gross_risk if gross_risk > 0 else 0.0
+    gross_rr_decision = (gross_rr_1 * config.primary_rr_weight) + (gross_rr_2 * config.stretch_rr_weight)
+
+    spread_pct, slippage_pct, liquidity_bucket = execution_cost_pct(
+        snapshot.avg_dollar_volume,
+        snapshot.atr_pct,
+        result.setup_type,
+    )
+    warnings: list[str] = []
+    fallback_spread = entry * spread_pct
+    quoted_spread = snapshot.ask - snapshot.bid if snapshot.ask > 0 and snapshot.bid > 0 and snapshot.ask >= snapshot.bid else 0.0
+    max_quoted_spread = entry * max(spread_pct * 2.5, 0.0005)
+    if quoted_spread > 0 and quoted_spread <= max_quoted_spread:
+        estimated_spread = quoted_spread
+        spread_source = "bid_ask"
+    elif quoted_spread > max_quoted_spread:
+        estimated_spread = fallback_spread
+        spread_source = "liquidity_fallback_capped_quote"
+        warnings.append("Bid/ask spread looked stale or too wide; liquidity fallback used.")
+    else:
+        estimated_spread = fallback_spread
+        spread_source = "liquidity_fallback"
+
+    entry_slippage = entry * slippage_pct
+    stop_slippage = entry * slippage_pct
+    target_slippage = entry * (slippage_pct * 0.50)
+    estimated_slippage = entry_slippage + stop_slippage
+    estimated_fees = config.fees_per_share
+    half_spread = estimated_spread / 2.0
+
+    net_entry = entry + half_spread + entry_slippage + estimated_fees
+    net_stop = stop - half_spread - stop_slippage - estimated_fees
+    net_target_1 = target_1 - half_spread - target_slippage - estimated_fees
+    net_target_2 = target_2 - half_spread - target_slippage - estimated_fees
+    net_risk = max(0.0, net_entry - net_stop)
+    net_reward_1 = max(0.0, net_target_1 - net_entry)
+    net_reward_2 = max(0.0, net_target_2 - net_entry)
+    net_rr_1 = net_reward_1 / net_risk if net_risk > 0 else 0.0
+    net_rr_2 = net_reward_2 / net_risk if net_risk > 0 else 0.0
+    net_rr = (net_rr_1 * config.primary_rr_weight) + (net_rr_2 * config.stretch_rr_weight)
+    return {
+        "gross_rr": round(gross_rr_decision, 4),
+        "gross_rr_1": round(gross_rr_1, 4),
+        "gross_rr_2": round(gross_rr_2, 4),
+        "gross_rr_decision": round(gross_rr_decision, 4),
+        "theoretical_entry": round(entry_info["theoretical_entry"], 4),
+        "executable_entry": round(entry, 4),
+        "gross_risk_per_share": round(gross_risk, 4),
+        "gross_reward_1_per_share": round(gross_reward_1, 4),
+        "gross_reward_2_per_share": round(gross_reward_2, 4),
+        "estimated_spread": round(estimated_spread, 4),
+        "estimated_slippage": round(estimated_slippage, 4),
+        "estimated_fees": round(estimated_fees, 4),
+        "spread_source": spread_source,
+        "execution_liquidity_bucket": liquidity_bucket,
+        "net_entry": round(net_entry, 4),
+        "net_stop_assumption": round(net_stop, 4),
+        "net_target_1_assumption": round(net_target_1, 4),
+        "net_target_2_assumption": round(net_target_2, 4),
+        "net_risk_per_share": round(net_risk, 4),
+        "net_reward_1_per_share": round(net_reward_1, 4),
+        "net_reward_2_per_share": round(net_reward_2, 4),
+        "net_rr_1": round(net_rr_1, 4),
+        "net_rr_2": round(net_rr_2, 4),
+        "net_rr": round(net_rr, 4),
+        "warnings": warnings,
+    }
+
+
+def resolve_entry_info(result: Any, fallback_price: float) -> dict[str, float]:
+    current_price = float(getattr(result, "current_price", fallback_price) or fallback_price or 0.0)
+    theoretical = getattr(result, "theoretical_entry", None)
+    executable = getattr(result, "executable_entry", None)
+    if theoretical in (None, ""):
+        theoretical = getattr(result, "buy_zone_low", None)
+    if theoretical in (None, ""):
+        buy_zone = getattr(result, "buy_zone", None)
+        if buy_zone and len(buy_zone) >= 1:
+            theoretical = buy_zone[0]
+    theoretical = float(theoretical or current_price)
+
+    if executable in (None, ""):
+        buy_low = getattr(result, "buy_zone_low", None)
+        buy_high = getattr(result, "buy_zone_high", None)
+        buy_zone = getattr(result, "buy_zone", None)
+        if (buy_low in (None, "") or buy_high in (None, "")) and buy_zone and len(buy_zone) >= 2:
+            buy_low, buy_high = buy_zone[0], buy_zone[1]
+        if buy_low not in (None, "") and buy_high not in (None, "") and float(buy_low) <= current_price <= float(buy_high):
+            executable = current_price
+        elif current_price > theoretical:
+            executable = current_price
+        else:
+            executable = theoretical
+    return {"theoretical_entry": float(theoretical), "executable_entry": float(executable or current_price)}
+
+
+def execution_cost_pct(avg_dollar_volume: float, atr_pct: float, setup_type: str) -> tuple[float, float, str]:
+    if avg_dollar_volume >= 500_000_000:
+        spread_pct, slippage_pct, bucket = 0.0003, 0.0007, "large_liquid"
+    elif avg_dollar_volume >= 100_000_000:
+        spread_pct, slippage_pct, bucket = 0.0008, 0.0015, "mid_liquid"
+    elif avg_dollar_volume >= 25_000_000:
+        spread_pct, slippage_pct, bucket = 0.0015, 0.0030, "lower_liquidity"
+    else:
+        spread_pct, slippage_pct, bucket = 0.0025, 0.0060, "low_liquidity"
+    if "breakout" in str(setup_type).lower():
+        slippage_pct += 0.0010 if avg_dollar_volume >= 100_000_000 else 0.0020
+    if atr_pct >= 6:
+        slippage_pct *= 1.15
+    return spread_pct, min(slippage_pct, 0.0075), bucket
+
+
+def calculate_earnings_blackout(ticker: str, config: AgentRiskConfig) -> dict[str, Any]:
+    warnings: list[str] = []
+    try:
+        earnings_date = fetch_next_earnings_date(ticker)
+    except Exception as exc:
+        earnings_date = None
+        warnings.append(f"Earnings data unavailable: {exc}")
+    if not earnings_date:
+        warnings.append("Earnings data unavailable.")
+        return {
+            "earnings_date": "",
+            "days_to_earnings": None,
+            "earnings_blackout": bool(config.block_unknown_earnings),
+            "warnings": warnings,
+        }
+    days = business_days_until(earnings_date)
+    blackout = days is not None and -config.earnings_blackout_after_days <= days <= config.earnings_blackout_before_days
+    return {
+        "earnings_date": earnings_date,
+        "days_to_earnings": days,
+        "earnings_blackout": bool(blackout),
+        "warnings": warnings,
+    }
+
+
+def calculate_entry_confirmation(
+    result: Any,
+    snapshot: CandidateMarketSnapshot,
+    config: AgentRiskConfig,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    observed = now if now is not None else datetime.now(timezone.utc)
+    if not config.require_entry_confirmation:
+        return {
+            "confirmation_status": "DISABLED",
+            "confirmation_reason": "Entry confirmation requirement disabled by config.",
+            "trigger_level": 0.0,
+            "close_above_trigger": True,
+            "vwap_reclaimed": False,
+            "retest_held": True,
+            "entry_confirmation_passed": True,
+            "confirmation_timeframe": "disabled",
+            "confirmation_candle_timestamp": "",
+            "warnings": [],
+        }
+
+    base = {
+        "confirmation_status": "UNKNOWN",
+        "confirmation_reason": "Entry confirmation unavailable.",
+        "trigger_level": 0.0,
+        "close_above_trigger": False,
+        "vwap_reclaimed": False,
+        "retest_held": False,
+        "entry_confirmation_passed": False,
+        "confirmation_timeframe": "1d_completed",
+        "confirmation_candle_timestamp": "",
+        "warnings": [],
+    }
+    buy_low = getattr(result, "buy_zone_low", None)
+    buy_high = getattr(result, "buy_zone_high", None)
+    if buy_low in (None, "") or buy_high in (None, ""):
+        base["warnings"] = ["Entry confirmation data unavailable; blocking auto-buy."]
+        return base
+
+    if config.entry_confirmation_intraday_enabled:
+        intraday_confirmation = calculate_entry_confirmation_from_frame(
+            result=result,
+            frame=snapshot.intraday,
+            buy_low=float(buy_low),
+            buy_high=float(buy_high),
+            timeframe=f"{config.entry_confirmation_intraday_interval}_completed",
+            drop_last=True,
+            lookback_candles=config.entry_confirmation_lookback_candles,
+            now=observed,
+        )
+        if intraday_confirmation["confirmation_status"] != "UNKNOWN":
+            return intraday_confirmation
+        base["warnings"].extend(intraday_confirmation.get("warnings", []))
+
+    daily = snapshot.daily
+    if daily is None or daily.empty or len(daily) < 3 or buy_low in (None, "") or buy_high in (None, ""):
+        if not base["warnings"]:
+            base["warnings"] = ["Entry confirmation data unavailable; blocking auto-buy."]
+        return base
+
+    daily_confirmation = calculate_entry_confirmation_from_frame(
+        result=result,
+        frame=daily,
+        buy_low=float(buy_low),
+        buy_high=float(buy_high),
+        timeframe="1d_completed",
+        drop_last=True,
+        lookback_candles=config.entry_confirmation_lookback_candles,
+        now=observed,
+    )
+    if daily_confirmation.get("warnings") and base["warnings"]:
+        daily_confirmation["warnings"] = [*base["warnings"], *daily_confirmation["warnings"]]
+    return daily_confirmation
+
+
+def calculate_entry_confirmation_from_frame(
+    *,
+    result: Any,
+    frame: pd.DataFrame | None,
+    buy_low: float,
+    buy_high: float,
+    timeframe: str,
+    drop_last: bool,
+    lookback_candles: int = 1,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    base = {
+        "confirmation_status": "UNKNOWN",
+        "confirmation_reason": "Entry confirmation unavailable.",
+        "trigger_level": 0.0,
+        "close_above_trigger": False,
+        "vwap_reclaimed": False,
+        "retest_held": False,
+        "entry_confirmation_passed": False,
+        "confirmation_timeframe": timeframe,
+        "confirmation_candle_timestamp": "",
+        "confirmation_window_used": 1,
+        "warnings": [],
+    }
+    if frame is None or frame.empty or len(frame) < 2:
+        base["warnings"] = [f"Not enough {timeframe} candles for entry confirmation."]
+        return base
+
+    # Keep the legacy argument for caller compatibility, but never trust row position
+    # (or drop_last=False) as evidence that a provider bar has actually closed.
+    try:
+        completed = completed_frame(
+            frame, timeframe, now if now is not None else datetime.now(timezone.utc)
+        )
+    except Exception:
+        base["warnings"] = ["Candle timing/calendar unavailable; blocking auto-buy."]
+        return base
+    if len(completed) < 2:
+        base["warnings"] = [f"Not enough completed {timeframe} candles for entry confirmation."]
+        return base
+
+    window = max(1, min(int(lookback_candles or 1), len(completed) - 1))
+    attempts: list[dict[str, Any]] = []
+    for offset in range(1, window + 1):
+        last = completed.iloc[-offset]
+        prev = completed.iloc[-offset - 1]
+        attempt = entry_confirmation_from_candles(
+            result=result,
+            last=last,
+            prev=prev,
+            candle_time=completed.index[-offset],
+            buy_low=buy_low,
+            buy_high=buy_high,
+            timeframe=timeframe,
+            confirmation_window_used=offset,
+            vwap=(rolling_vwap(completed.iloc[: len(completed) - offset + 1])
+                  if timeframe.removesuffix("_completed") in INTERVAL_MINUTES else None),
+        )
+        attempts.append(attempt)
+        if not attempt["entry_confirmation_passed"]:
+            continue
+        if offset == 1 or latest_candle_keeps_setup_relevant(
+            latest=completed.iloc[-1],
+            buy_low=buy_low,
+            buy_high=buy_high,
+            setup_type=str(getattr(result, "setup_type", "") or ""),
+        ):
+            if offset > 1:
+                attempt["confirmation_reason"] += (
+                    f" Confirmation accepted from the last {offset} completed candles; "
+                    "the latest completed candle kept the setup relevant."
+                )
+            return attempt
+
+    failed = attempts[0] if attempts else base
+    if window > 1:
+        failed["confirmation_window_used"] = window
+        failed["warnings"] = unique_strings(
+            [
+                *failed.get("warnings", []),
+                f"No completed candle in the last {window} candles confirmed entry while the setup stayed relevant.",
+            ]
+        )
+    return failed
+
+
+def entry_confirmation_from_candles(
+    *,
+    result: Any,
+    last: pd.Series,
+    prev: pd.Series,
+    candle_time: Any,
+    buy_low: float,
+    buy_high: float,
+    timeframe: str,
+    confirmation_window_used: int,
+    vwap: float | None = None,
+) -> dict[str, Any]:
+    close = float(last["Close"])
+    open_ = float(last["Open"])
+    low = float(last["Low"])
+    high = float(last["High"])
+    prev_close = float(prev["Close"])
+    setup_type = str(getattr(result, "setup_type", "") or "").lower()
+    candle_timestamp = candle_time.isoformat() if hasattr(candle_time, "isoformat") else str(candle_time)
+    bullish_or_reclaim = close >= open_ and close >= prev_close
+    falling_into_zone = close < open_ and close < prev_close
+
+    trigger_level = buy_high
+    close_above_trigger = close >= trigger_level
+    retest_held = low >= buy_low and close >= buy_low
+    vwap_reclaimed = False
+
+    if "breakout" in setup_type:
+        passed = close_above_trigger and retest_held and not falling_into_zone
+        reason = (
+            "Completed candle closed above retest trigger and held the zone."
+            if passed
+            else "Breakout/retest confirmation requires completed close above trigger, held retest, and no falling candle."
+        )
+    elif "vwap" in setup_type:
+        vwap_reclaimed = bool(vwap and close >= vwap and close >= open_ and close >= prev_close)
+        trigger_level = float(vwap or trigger_level)
+        close_above_trigger = bool(vwap and close >= vwap)
+        retest_held = close >= buy_low and not falling_into_zone
+        passed = vwap_reclaimed and retest_held
+        reason = (
+            "Completed candle reclaimed regular-session VWAP and held the setup zone."
+            if passed
+            else "VWAP reclaim requires completed close above regular-session VWAP with hold/follow-through."
+        )
+    else:
+        zone_width = max(0.0, buy_high - buy_low)
+        zone_mid = buy_low + (zone_width * 0.50)
+        candle_range = max(high - low, 0.0001)
+        close_position = (close - low) / candle_range
+        touched_zone = low <= buy_high and high >= buy_low
+        strong_bullish_reclaim = (
+            touched_zone
+            and close >= max(buy_low, zone_mid)
+            and close > open_
+            and close >= prev_close
+            and close_position >= 0.60
+        )
+        retest_held = touched_zone and close >= buy_low
+        close_above_trigger = close >= buy_high
+        passed = retest_held and not falling_into_zone and (close_above_trigger or strong_bullish_reclaim)
+        reason = (
+            "Completed candle closed above the buy zone or showed a strong bullish reclaim from the zone."
+            if passed
+            else (
+                "Support/Fib setup requires completed close above the buy zone or a strong bullish "
+                "reclaim from the zone; weak or falling candles are blocked."
+            )
+        )
+
+    return {
+        "confirmation_status": "PASSED" if passed else "FAILED",
+        "confirmation_reason": reason,
+        "trigger_level": round(float(trigger_level or 0.0), 4),
+        "close_above_trigger": bool(close_above_trigger),
+        "vwap_reclaimed": bool(vwap_reclaimed),
+        "retest_held": bool(retest_held),
+        "entry_confirmation_passed": bool(passed),
+        "confirmation_timeframe": timeframe,
+        "confirmation_vwap_reference": "REGULAR_SESSION_VWAP" if "vwap" in setup_type else None,
+        "confirmation_vwap_price": round(vwap, 4) if vwap is not None and "vwap" in setup_type else None,
+        "confirmation_candle_timestamp": candle_timestamp,
+        "confirmation_window_used": confirmation_window_used,
+        "warnings": [] if passed else [reason],
+    }
+
+
+def latest_candle_keeps_setup_relevant(
+    *,
+    latest: pd.Series,
+    buy_low: float,
+    buy_high: float,
+    setup_type: str,
+) -> bool:
+    close = float(latest["Close"])
+    open_ = float(latest["Open"])
+    low = float(latest["Low"])
+    high = float(latest["High"])
+    setup = setup_type.lower()
+    if close < buy_low:
+        return False
+    if "breakout" in setup:
+        return close >= buy_low and high >= buy_high
+    if "vwap" in setup:
+        return close >= buy_low and close >= open_
+    return high >= buy_low and close >= buy_low
+
+
+def rolling_vwap(frame: pd.DataFrame, lookback: int = 20) -> float | None:
+    """Compatibility name: confirmation now shares the scanner's session reset.
+
+    The old lookback argument no longer mixes prior sessions into the reference.
+    Caller supplies completed regular-session intraday candles only.
+    """
+    try:
+        return session_vwap(frame)
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def cooldown_check(
+    *,
+    ticker: str,
+    result: Any,
+    net_rr_info: dict[str, Any],
+    confirmation: dict[str, Any],
+    recent_stop_events: dict[str, dict[str, Any]],
+    config: AgentRiskConfig,
+) -> dict[str, Any]:
+    event = recent_stop_events.get(ticker.upper())
+    if not event:
+        return {
+            "cooldown_active": False,
+            "last_stop_date": "",
+            "cooldown_days_remaining": 0,
+            "cooldown_exception_used": False,
+            "cooldown_reason": "",
+            "warnings": [],
+        }
+
+    days_remaining = int(event.get("days_remaining") or 0)
+    if days_remaining <= 0:
+        return {
+            "cooldown_active": False,
+            "last_stop_date": str(event.get("last_stop_date") or ""),
+            "cooldown_days_remaining": 0,
+            "cooldown_exception_used": False,
+            "cooldown_reason": "",
+            "warnings": [],
+        }
+
+    current_setup = str(getattr(result, "setup_type", "") or "")
+    last_setup = str(event.get("setup_type") or "")
+    exception_used = (
+        float(getattr(result, "score", 0) or 0) >= config.cooldown_exception_setup_score
+        and float(net_rr_info.get("net_rr_1") or 0) >= config.cooldown_exception_net_rr1
+        and bool(confirmation.get("entry_confirmation_passed"))
+        and current_setup
+        and last_setup
+        and current_setup != last_setup
+    )
+    reason = (
+        f"Stop-loss cooldown active after {event.get('last_stop_date')}; "
+        f"{days_remaining} trading days remaining."
+    )
+    warnings = [] if exception_used else [reason]
+    return {
+        "cooldown_active": True,
+        "last_stop_date": str(event.get("last_stop_date") or ""),
+        "cooldown_days_remaining": days_remaining,
+        "cooldown_exception_used": bool(exception_used),
+        "cooldown_reason": reason if not exception_used else "Cooldown exception used for stronger, meaningfully new setup.",
+        "warnings": warnings,
+    }
+
+
+def validate_targets(
+    result: Any,
+    snapshot: CandidateMarketSnapshot,
+    config: AgentRiskConfig | None = None,
+) -> dict[str, Any]:
+    warnings: list[str] = []
+    price = float(result.current_price or 0.0)
+    atr = snapshot.atr
+    t1 = float(result.target_1 or 0.0)
+    t2 = float(result.target_2 or 0.0)
+    if atr <= 0 or price <= 0 or t1 <= 0 or t2 <= 0:
+        return {
+            "target_1_atr_distance": 0.0,
+            "target_2_atr_distance": 0.0,
+            "status": "UNKNOWN",
+            "market_structure_status": "UNKNOWN",
+            "previous_resistance": 0.0,
+            "prior_high_20": 0.0,
+            "prior_high_63": 0.0,
+            "warnings": ["Target ATR feasibility unavailable."],
+        }
+    structure = assess_target_market_structure(snapshot.daily, price, atr, t1, t2, result.setup_type)
+    warnings.extend(structure["warnings"])
+    d1 = (t1 - price) / atr
+    d2 = (t2 - price) / atr
+    min_target1_distance = config.minimum_target1_atr_distance if config else 0.75
+    if d1 <= 0 or d2 <= 0:
+        status = "INVALID"
+        warnings.append("Target is not above current price.")
+    elif d1 > 7 or d2 > 14:
+        status = "EXTENDED"
+        warnings.append("Target distance is extended versus daily ATR.")
+    elif structure["status"] == "EXTENDED_ABOVE_STRUCTURE":
+        status = "EXTENDED"
+        warnings.append("Target distance is extended versus recent market structure.")
+    elif d1 > 5 or d2 > 10:
+        status = "AGGRESSIVE"
+        warnings.append("Target distance is aggressive versus daily ATR.")
+    elif d1 < min_target1_distance:
+        status = "LOW_REWARD_DISTANCE"
+        warnings.append("Target 1 is close versus daily ATR.")
+    else:
+        status = "OK"
+    return {
+        "target_1_atr_distance": round(d1, 4),
+        "target_2_atr_distance": round(d2, 4),
+        "status": status,
+        "market_structure_status": structure["status"],
+        "previous_resistance": structure["previous_resistance"],
+        "prior_high_20": structure["prior_high_20"],
+        "prior_high_63": structure["prior_high_63"],
+        "warnings": warnings,
+    }
+
+
+def assess_target_market_structure(
+    daily: pd.DataFrame | None,
+    price: float,
+    atr: float,
+    target_1: float,
+    target_2: float,
+    setup_type: str,
+) -> dict[str, Any]:
+    if daily is None or daily.empty or "High" not in daily:
+        return {
+            "status": "UNKNOWN",
+            "previous_resistance": 0.0,
+            "prior_high_20": 0.0,
+            "prior_high_63": 0.0,
+            "warnings": ["Market structure target validation unavailable."],
+        }
+    history = daily.iloc[:-1] if len(daily) > 1 else daily
+    if history.empty:
+        return {
+            "status": "UNKNOWN",
+            "previous_resistance": 0.0,
+            "prior_high_20": 0.0,
+            "prior_high_63": 0.0,
+            "warnings": ["Market structure target validation unavailable."],
+        }
+    high_20 = float(history["High"].tail(20).max())
+    high_63 = float(history["High"].tail(63).max())
+    previous_resistance = high_20 if high_20 >= price else high_63
+    breakout = "breakout" in str(setup_type).lower()
+    warnings: list[str] = []
+
+    if target_1 <= high_20 * 1.02:
+        status = "SUPPORTED_BY_20D_RESISTANCE"
+    elif target_1 <= high_63 * 1.03:
+        status = "SUPPORTED_BY_63D_RESISTANCE"
+    elif breakout and target_1 <= price + (atr * 5) and target_2 <= price + (atr * 10):
+        status = "BREAKOUT_MEASURED_MOVE"
+    elif target_1 > high_63 + (atr * 4) or target_2 > high_63 + (atr * 8):
+        status = "EXTENDED_ABOVE_STRUCTURE"
+        warnings.append("Targets are extended above recent resistance structure.")
+    else:
+        status = "MIXED_STRUCTURE"
+
+    return {
+        "status": status,
+        "previous_resistance": round(previous_resistance, 4),
+        "prior_high_20": round(high_20, 4),
+        "prior_high_63": round(high_63, 4),
+        "warnings": warnings,
+    }
+
+
+def sector_exposure_check(
+    *,
+    ticker: str,
+    sector: str,
+    initial_action: str,
+    trade_cash_out: float,
+    open_positions: dict[str, dict[str, Any]],
+    sector_map: dict[str, str],
+    run_context: AgentRunRiskContext,
+) -> dict[str, Any]:
+    before = current_sector_exposure(ticker, sector, open_positions, sector_map)
+    warnings = []
+    after = before + (trade_cash_out if initial_action == "BUY_SIMULATED" else 0.0)
+    cap = sector_exposure_cap(run_context)
+    limit_exceeded = initial_action == "BUY_SIMULATED" and after > cap
+    if limit_exceeded:
+        warnings.append("Sector exposure limit would be exceeded.")
+    return {"before": round(before, 2), "after": round(after, 2), "cap": round(cap, 2), "limit_exceeded": limit_exceeded, "warnings": warnings}
+
+
+def current_sector_exposure(
+    ticker: str,
+    sector: str,
+    open_positions: dict[str, dict[str, Any]],
+    sector_map: dict[str, str],
+) -> float:
+    before = 0.0
+    for open_ticker, pos in open_positions.items():
+        if str(open_ticker).upper() == ticker:
+            continue
+        if sector_map.get(str(open_ticker).upper(), "Unknown") == sector:
+            before += float(pos.get("exposure_ils") or 0)
+    return before
+
+
+def sector_exposure_cap(run_context: AgentRunRiskContext) -> float:
+    pct = (
+        run_context.config.sector_exposure_bull_pct
+        if run_context.market_regime.label == "BULL"
+        else run_context.config.sector_exposure_neutral_pct
+    )
+    return max(0.0, run_context.market_regime.max_total_exposure * pct)
+
+
+def factor_exposure_check(
+    *,
+    ticker: str,
+    factor_tags: list[str],
+    initial_action: str,
+    trade_cash_out: float,
+    open_positions: dict[str, dict[str, Any]],
+    sector_map: dict[str, str],
+    run_context: AgentRunRiskContext,
+) -> dict[str, Any]:
+    before = current_factor_exposure(ticker, open_positions, sector_map)
+    after = dict(before)
+    if initial_action == "BUY_SIMULATED":
+        for tag in factor_tags:
+            after[tag] = after.get(tag, 0.0) + trade_cash_out
+    cap = factor_exposure_cap(run_context)
+    limit_exceeded = initial_action == "BUY_SIMULATED" and any(after.get(tag, 0.0) > cap for tag in factor_tags)
+    warnings = ["Factor/theme exposure limit would be exceeded."] if limit_exceeded else []
+    return {
+        "before": {key: round(value, 2) for key, value in sorted(before.items())},
+        "after": {key: round(value, 2) for key, value in sorted(after.items())},
+        "cap": round(cap, 2),
+        "limit_exceeded": limit_exceeded,
+        "warnings": warnings,
+    }
+
+
+def current_factor_exposure(
+    ticker: str,
+    open_positions: dict[str, dict[str, Any]],
+    sector_map: dict[str, str],
+) -> dict[str, float]:
+    before: dict[str, float] = {}
+    for open_ticker, pos in open_positions.items():
+        open_ticker = str(open_ticker).upper()
+        if open_ticker == ticker:
+            continue
+        metadata = position_metadata(pos)
+        stored_tags = metadata.get("factor_tags")
+        sector = str(metadata.get("sector") or sector_map.get(open_ticker, "Unknown"))
+        bucket = str(metadata.get("market_cap_bucket") or "Unknown")
+        tags = set(factor_tags_for(open_ticker, sector, bucket))
+        tags.update(factor_tags_for(open_ticker, sector_map.get(open_ticker, "Unknown"), bucket))
+        if isinstance(stored_tags, list):
+            tags.update(tag.strip() for tag in stored_tags if isinstance(tag, str) and tag.strip())
+        for tag in tags:
+            before[tag] = before.get(tag, 0.0) + float(pos.get("exposure_ils") or 0)
+    return before
+
+
+def factor_exposure_cap(run_context: AgentRunRiskContext) -> float:
+    pct = (
+        run_context.config.factor_exposure_bull_pct
+        if run_context.market_regime.label == "BULL"
+        else run_context.config.factor_exposure_neutral_pct
+    )
+    return max(0.0, run_context.market_regime.max_total_exposure * pct)
+
+
+def correlation_check(
+    *,
+    ticker: str,
+    candidate_daily: pd.DataFrame | None,
+    open_positions: dict[str, dict[str, Any]],
+    analysis_period: str,
+    threshold: float | None = None,
+) -> dict[str, Any]:
+    warnings: list[str] = []
+    best_ticker = ""
+    best_corr: float | None = None
+    peers = sorted({str(symbol).upper() for symbol in open_positions if str(symbol).upper() != ticker.upper()})
+    checked: list[str] = []
+    missing: list[str] = []
+
+    def evidence() -> dict[str, Any]:
+        limit = threshold if threshold is not None else float(os.getenv("MARKET_LENS_CORRELATION_BLOCK_THRESHOLD", "0.85"))
+        warning = best_corr is not None and best_corr >= limit
+        status = ("NOT_REQUIRED" if not peers else "UNKNOWN" if not checked
+                  else "PARTIAL" if missing else "HIGH" if warning else "PASS")
+        return {
+            "status": status,
+            "positions_expected": len(peers), "positions_checked": len(checked),
+            "missing_tickers": missing,
+            "correlation_warning": bool(warning),
+            "highest_correlation_ticker": best_ticker,
+            "highest_correlation_value": round(best_corr, 4) if best_corr is not None else None,
+            "warnings": warnings,
+        }
+
+    if not peers:
+        return evidence()
+    if candidate_daily is None or candidate_daily.empty or "Close" not in candidate_daily:
+        missing.extend(peers)
+        warnings.append("Candidate correlation data unavailable; correlation is not verified.")
+        return evidence()
+    candidate_returns = candidate_daily["Close"].pct_change(fill_method=None).replace([math.inf, -math.inf], float("nan")).dropna().tail(90)
+    if len(candidate_returns) < 40:
+        missing.extend(peers)
+        warnings.append("Insufficient candidate history for correlation check; correlation is not verified.")
+        return evidence()
+    for open_ticker in peers:
+        try:
+            open_daily = fetch_daily_frame(open_ticker, period=analysis_period)
+            open_returns = open_daily["Close"].pct_change(fill_method=None).replace([math.inf, -math.inf], float("nan")).dropna().tail(90)
+            aligned = pd.concat([candidate_returns, open_returns], axis=1, join="inner").dropna()
+            if len(aligned) < 40:
+                missing.append(open_ticker)
+                warnings.append(f"Insufficient overlapping history for {open_ticker}; correlation is not verified.")
+                continue
+            if bool((aligned.std() <= 0).any()):
+                missing.append(open_ticker)
+                warnings.append(f"Undefined correlation for {open_ticker}; correlation is not verified.")
+                continue
+            corr = float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]))
+            if not math.isfinite(corr):
+                missing.append(open_ticker)
+                warnings.append(f"Undefined correlation for {open_ticker}; correlation is not verified.")
+                continue
+            checked.append(open_ticker)
+            if best_corr is None or corr > best_corr:
+                best_corr = corr
+                best_ticker = open_ticker
+        except Exception as exc:
+            missing.append(open_ticker)
+            warnings.append(f"Correlation data unavailable for {open_ticker}: {exc}")
+    return evidence()
+
+
+def factor_tags_for(ticker: str, sector: str, market_cap_bucket_value: str) -> list[str]:
+    tags = {sector} if sector and sector != "Unknown" else set()
+    semis = {"NVDA", "AMD", "AVGO", "ASML", "AMAT", "LRCX", "KLAC", "TSM", "MU", "QCOM", "INTC", "TXN", "SMCI"}
+    mega_tech = {"AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "AMZN", "META", "TSLA", "AVGO"}
+    high_beta = {"CRWD", "SNOW", "NET", "PLTR", "DDOG", "SMCI", "TSLA", "AMD", "NVDA", "PANW", "NOW"}
+    if ticker in semis or sector == "Semiconductors":
+        tags.add("AI / Semiconductors")
+    if ticker in mega_tech:
+        tags.add("Mega Cap Tech")
+        tags.add("Rates-sensitive Growth")
+    if ticker in high_beta:
+        tags.add("High Beta Growth")
+    if sector in {"Healthcare", "Utilities", "Consumer Defensive"}:
+        tags.add("Defensive")
+    if sector == "Financials":
+        tags.add("Financials")
+    if sector == "Energy":
+        tags.add("Energy")
+    if sector == "Consumer":
+        tags.add("Consumer Cyclical")
+    if market_cap_bucket_value == "Small Cap":
+        tags.add("Small Cap / Risk-On")
+    if sector in {"Utilities", "Consumer Defensive"}:
+        tags.add("Low Volatility")
+    return sorted(tags)
+
+
+def pct_return(close: Any, lookback: int) -> float:
+    if len(close) <= lookback:
+        lookback = len(close) - 1
+    if lookback <= 0:
+        return 0.0
+    start = float(close.iloc[-lookback])
+    end = float(close.iloc[-1])
+    return end / start - 1 if start > 0 else 0.0
+
+
+def trend_is_bullish(state: dict[str, Any]) -> bool:
+    return state.get("trend") == "bullish"
+
+
+def trend_is_bearish(state: dict[str, Any]) -> bool:
+    return state.get("trend") == "bearish"
+
+
+def vix_is_calm(state: dict[str, Any]) -> bool:
+    if vix_is_stressed(state):
+        return False
+    return state.get("trend") == "calm" or 0 < float(state.get("price") or 99) < 20
+
+
+def vix_is_stressed(state: dict[str, Any]) -> bool:
+    return state.get("trend") == "stressed" or float(state.get("price") or 0) >= 25
+
+
+def market_cap_bucket(market_cap: float) -> str:
+    if market_cap >= 200_000_000_000:
+        return "Mega Cap"
+    if market_cap >= 10_000_000_000:
+        return "Large Cap"
+    if market_cap >= 2_000_000_000:
+        return "Mid Cap"
+    if market_cap > 0:
+        return "Small Cap"
+    return "Unknown"
+
+
+def normalized_momentum_score(ret_1m: float, ret_3m: float, bucket: str) -> float:
+    multiplier = {"Mega Cap": 360, "Large Cap": 320, "Mid Cap": 270, "Small Cap": 220}.get(bucket, 280)
+    return round(clamp(50 + ret_1m * 160 + ret_3m * multiplier, 0, 100), 2)
+
+
+def normalized_atr_score(atr_pct: float, bucket: str) -> float:
+    ideal = {"Mega Cap": (1.0, 4.8), "Large Cap": (1.2, 5.5), "Mid Cap": (1.6, 6.5), "Small Cap": (2.0, 7.5)}.get(
+        bucket,
+        (1.2, 6.0),
+    )
+    low, high = ideal
+    if low <= atr_pct <= high:
+        return 100.0
+    if atr_pct < low:
+        return round(clamp(45 + (atr_pct / max(low, 0.1)) * 55, 0, 100), 2)
+    return round(clamp(100 - ((atr_pct - high) / max(high, 0.1)) * 50, 20, 100), 2)
+
+
+def normalized_liquidity_score(avg_dollar_volume: float, bucket: str) -> float:
+    target = {
+        "Mega Cap": 500_000_000,
+        "Large Cap": 150_000_000,
+        "Mid Cap": 50_000_000,
+        "Small Cap": 20_000_000,
+    }.get(bucket, 100_000_000)
+    if avg_dollar_volume <= 0:
+        return 35.0
+    return round(clamp(math.log10(avg_dollar_volume / target + 1) * 75, 0, 100), 2)
+
+
+def business_days_until(date_text: str) -> int | None:
+    try:
+        target = pd.Timestamp(date_text).date()
+    except Exception:
+        return None
+    today = datetime.now(timezone.utc).date()
+    if target >= today:
+        return max(0, len(pd.bdate_range(today, target)) - 1)
+    return -max(1, len(pd.bdate_range(target, today)) - 1)
+
+
+def unique_strings(values: list[str]) -> list[str]:
+    seen = set()
+    result = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, float(value)))

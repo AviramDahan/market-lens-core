@@ -1,0 +1,1172 @@
+import asyncio
+import json
+import os
+import sys
+import types
+from datetime import datetime
+
+import pandas as pd
+from fastapi.testclient import TestClient
+
+if "psycopg" not in sys.modules:
+    psycopg_stub = types.ModuleType("psycopg")
+    psycopg_rows_stub = types.ModuleType("psycopg.rows")
+    psycopg_types_stub = types.ModuleType("psycopg.types")
+    psycopg_json_stub = types.ModuleType("psycopg.types.json")
+    psycopg_rows_stub.dict_row = object()
+    psycopg_json_stub.Jsonb = dict
+    psycopg_stub.Connection = object
+    psycopg_stub.connect = lambda *_args, **_kwargs: None
+    psycopg_types_stub.json = psycopg_json_stub
+    psycopg_stub.rows = psycopg_rows_stub
+    psycopg_stub.types = psycopg_types_stub
+    sys.modules["psycopg"] = psycopg_stub
+    sys.modules["psycopg.rows"] = psycopg_rows_stub
+    sys.modules["psycopg.types"] = psycopg_types_stub
+    sys.modules["psycopg.types.json"] = psycopg_json_stub
+
+import app.main as main
+import app.monitor_trigger as monitor_trigger
+import app.scan_trigger as scan_trigger
+from app.monitor_trigger import detect_live_monitor_event
+from app.scan_trigger import ScanScheduleDecision
+
+
+def reset_rate_limits() -> None:
+    os.environ["MARKET_LENS_MONITOR_TRIGGER_GLOBAL_COOLDOWN_SECONDS"] = "0"
+    os.environ["MARKET_LENS_MONITOR_TRIGGER_EVENT_COOLDOWN_SECONDS"] = "0"
+    monitor_trigger._GLOBAL_TRIGGER_AT = 0.0
+    monitor_trigger._EVENT_TRIGGER_AT.clear()
+    scan_trigger._DISPATCHED_SCAN_KEYS.clear()
+    main._LIVE_PRICE_CACHE.clear()
+    main._AGENT_DASHBOARD_CACHE.clear()
+    main._POSITION_ATTENTION_ALERT_AT.clear()
+
+
+def test_detect_live_monitor_event_prefers_stop_first() -> None:
+    position = {"ticker": "TEST", "stop_loss": 95, "target_1": 105, "target_2": 112}
+    event = detect_live_monitor_event(position, 94.8)
+    assert event is not None
+    assert event.event_type == "EXIT_STOP"
+    assert event.threshold == 95
+
+
+def test_agent_dashboard_cache_reuses_until_tracker_changes(monkeypatch, tmp_path) -> None:
+    reset_rate_limits()
+    tracker_dir = tmp_path / "agent_tracker"
+    tracker_dir.mkdir()
+    tracker = tracker_dir / main.TRACKER_NAME
+    tracker.write_text("first", encoding="utf-8")
+    calls = []
+
+    def fake_build(project_root, selected_date=None):
+        calls.append((project_root, selected_date))
+        return {"status": "ok", "call": len(calls), "selected_date": selected_date or ""}
+
+    monkeypatch.setattr(main, "AGENT_TRACKER_DIR", tracker_dir)
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(main, "DASHBOARD_CACHE_TTL_SECONDS", 120)
+    monkeypatch.setattr(main, "build_agent_dashboard", fake_build)
+
+    first = main.cached_agent_dashboard()
+    second = main.cached_agent_dashboard()
+    assert first is second
+    assert first["call"] == 1
+    assert len(calls) == 1
+
+    tracker.write_text("tracker changed", encoding="utf-8")
+    third = main.cached_agent_dashboard()
+    assert third["call"] == 2
+    assert len(calls) == 2
+
+
+def test_current_agent_dashboard_enriches_legacy_snapshot(monkeypatch, tmp_path) -> None:
+    reset_rate_limits()
+    snapshot_path = tmp_path / "agent_results" / "dashboard_snapshot.json"
+    summary_dir = snapshot_path.parent / "summaries"
+    summary_dir.mkdir(parents=True)
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "latest_run": {"timestamp": "2026-07-31T14:30:00Z"},
+                "recent_trades": [{"chart_url": "/agent-results/charts/missing-old-chart.png"}],
+                "latest_setups": [
+                    {
+                        "ticker": "TEST",
+                        "company_name": "Test Corp",
+                        "sector": "Technology",
+                        "action": "WATCH",
+                        "setup_type": "Breakout + Retest",
+                        "setup_score": 0.57,
+                        "reason": "Entry confirmation failed on completed candle.",
+                        "decision_json": {
+                            "setup_type": "Breakout + Retest",
+                            "setup_score": 0.57,
+                            "weighted_net_rr": 2.1,
+                            "entry_confirmation_passed": False,
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (summary_dir / "daily_summary_2026-07-31.json").write_text(
+        '{"BUY_SIMULATED_count": 0, "WATCH_READY_count": 1}',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(main, "AGENT_RESULTS_DIR", snapshot_path.parent)
+    monkeypatch.setattr(main, "DASHBOARD_SNAPSHOT_PATH", snapshot_path)
+    monkeypatch.setattr(
+        main,
+        "sync_dashboard_snapshot_if_enabled",
+        lambda project_root: {"enabled": False, "reason": "disabled in test"},
+    )
+    monkeypatch.setattr(
+        main,
+        "sync_dashboard_snapshot_assets_if_enabled",
+        lambda project_root, dashboard: {"enabled": False, "reason": "disabled in test"},
+    )
+
+    dashboard = main.current_agent_dashboard()
+
+    assert dashboard["decision_diagnostics"]["blockers"]["Entry confirmation missing"] == 1
+    assert dashboard["decision_diagnostics"]["near_misses"][0]["ticker"] == "TEST"
+    assert dashboard["decision_diagnostics"]["entry_blockers_summary"][0]["label"] == "Entry confirmation missing"
+    assert dashboard["decision_diagnostics"]["closest_to_entry"][0]["ticker"] == "TEST"
+    assert dashboard["daily_summary"]["WATCH_READY_count"] == 1
+    assert dashboard["recent_trades"][0]["chart_url"] == ""
+
+
+def test_current_agent_dashboard_syncs_assets_before_sanitizing(monkeypatch, tmp_path) -> None:
+    reset_rate_limits()
+    snapshot_path = tmp_path / "agent_results" / "dashboard_snapshot.json"
+    chart_url = "/agent-results/charts/latest-chart.png"
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "latest_run": {
+                    "timestamp": "2026-08-03T17:04:30Z",
+                    "screenshot_url": chart_url,
+                },
+                "latest_setups": [{"ticker": "TEST", "chart_url": chart_url}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_asset_sync(project_root, dashboard):
+        assert dashboard["latest_run"]["screenshot_url"] == chart_url
+        asset_path = project_root / "agent_results" / "charts" / "latest-chart.png"
+        asset_path.parent.mkdir(parents=True, exist_ok=True)
+        asset_path.write_bytes(b"png")
+        return {"enabled": True, "downloaded": 1}
+
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(main, "AGENT_RESULTS_DIR", snapshot_path.parent)
+    monkeypatch.setattr(main, "DASHBOARD_SNAPSHOT_PATH", snapshot_path)
+    monkeypatch.setattr(
+        main,
+        "sync_dashboard_snapshot_if_enabled",
+        lambda project_root: {"enabled": True, "downloaded": True},
+    )
+    monkeypatch.setattr(main, "sync_dashboard_snapshot_assets_if_enabled", fake_asset_sync)
+
+    dashboard = main.current_agent_dashboard()
+
+    assert dashboard["latest_run"]["screenshot_url"] == chart_url
+    assert dashboard["latest_setups"][0]["chart_url"] == chart_url
+    assert dashboard["results_sync"]["asset_sync"]["downloaded"] == 1
+
+
+def test_current_agent_dashboard_reconciles_realized_pnl_in_legacy_snapshot(monkeypatch, tmp_path) -> None:
+    reset_rate_limits()
+    snapshot_path = tmp_path / "agent_results" / "dashboard_snapshot.json"
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "summary": {"realized_pnl_ils": 50},
+                "recent_trades": [
+                    {
+                        "timestamp": "2026-09-01T14:00:00Z",
+                        "action": "BUY_SIMULATED",
+                        "ticker": "TEST",
+                        "entry_price_usd": 100,
+                        "price_usd": 100,
+                        "quantity": 10,
+                        "cash_out_ils": 1000,
+                        "stop_loss": 95,
+                    },
+                    {
+                        "timestamp": "2026-09-02T14:00:00Z",
+                        "action": "TAKE_PARTIAL_PROFIT",
+                        "ticker": "TEST",
+                        "exit_price_usd": 110,
+                        "price_usd": 110,
+                        "quantity": 5,
+                        "cash_in_ils": 550,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(main, "AGENT_RESULTS_DIR", snapshot_path.parent)
+    monkeypatch.setattr(main, "DASHBOARD_SNAPSHOT_PATH", snapshot_path)
+    monkeypatch.setattr(main, "sync_dashboard_snapshot_if_enabled", lambda _root: {"enabled": False})
+    monkeypatch.setattr(
+        main,
+        "sync_dashboard_snapshot_assets_if_enabled",
+        lambda _root, _dashboard: {"enabled": False},
+    )
+
+    dashboard = main.current_agent_dashboard()
+
+    assert dashboard["summary"]["closed_trade_realized_pnl_ils"] == 0
+    assert dashboard["summary"]["open_lot_partial_realized_pnl_ils"] == 50
+    assert dashboard["summary"]["all_lifecycle_realized_pnl_ils"] == 50
+    assert dashboard["summary"]["realized_pnl_reconciliation_delta_ils"] == 0
+    assert dashboard["full_trade_performance"]["open_count"] == 1
+
+
+def test_detect_live_monitor_event_target_2_before_target_1() -> None:
+    position = {"ticker": "TEST", "stop_loss": 95, "target_1": 105, "target_2": 112}
+    event = detect_live_monitor_event(position, 113)
+    assert event is not None
+    assert event.event_type == "TAKE_PROFIT"
+    assert event.threshold == 112
+
+
+def test_detect_live_monitor_event_uses_intraday_high_low_touch() -> None:
+    position = {"ticker": "TEST", "stop_loss": 95, "target_1": 105, "target_2": 112}
+
+    target_event = detect_live_monitor_event(position, 104.5, live_high=105.2, live_low=103.8)
+    assert target_event is not None
+    assert target_event.event_type == "TAKE_PARTIAL_PROFIT"
+    assert target_event.live_high == 105.2
+    assert "1m high" in target_event.reason
+
+    stop_event = detect_live_monitor_event(position, 96.1, live_high=97.0, live_low=94.8)
+    assert stop_event is not None
+    assert stop_event.event_type == "EXIT_STOP"
+    assert stop_event.live_low == 94.8
+    assert "1m low" in stop_event.reason
+
+
+def test_detect_live_monitor_event_does_not_repeat_target_1_after_partial() -> None:
+    position = {
+        "ticker": "TEST",
+        "stop_loss": 100,
+        "target_1": 105,
+        "target_2": 112,
+        "notes": "Partial profit taken; stop moved to breakeven.",
+    }
+    assert detect_live_monitor_event(position, 106) is None
+
+    event = detect_live_monitor_event(position, 113)
+    assert event is not None
+    assert event.event_type == "TAKE_PROFIT"
+
+
+def test_fetch_live_price_prefers_extended_hours_intraday(monkeypatch) -> None:
+    reset_rate_limits()
+    calls = []
+    frame = pd.DataFrame(
+        {"Close": [220.84]},
+        index=pd.DatetimeIndex(["2026-06-22T23:15:00Z"]),
+    )
+
+    def fake_fetch_intraday_frame(ticker, period="5d", interval="1m", include_prepost=False):
+        calls.append((ticker, period, interval, include_prepost))
+        return frame
+
+    monkeypatch.setattr(main, "fetch_intraday_frame", fake_fetch_intraday_frame)
+
+    price, source_time = main.fetch_live_price("ba")
+
+    assert price == 220.84
+    assert source_time == "2026-06-22T23:15:00+00:00"
+    assert calls == [("BA", "5d", "1m", True)]
+
+
+def test_trigger_monitor_endpoint_skips_without_open_position(monkeypatch) -> None:
+    reset_rate_limits()
+    monkeypatch.setattr(main, "monitor_agent_dashboard", lambda: {"status": "ok", "open_positions": []})
+    client = TestClient(main.app)
+    response = client.post("/agent/trigger-monitor", json={"ticker": "TEST", "live_price": 105})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered"] is False
+    assert payload["status"] == "skipped"
+
+
+def test_trigger_monitor_endpoint_dispatches_when_live_price_touches_target(monkeypatch) -> None:
+    reset_rate_limits()
+    monkeypatch.setenv("GITHUB_ACTIONS_TRIGGER_TOKEN", "test-token")
+    monkeypatch.setattr(
+        main,
+        "monitor_agent_dashboard",
+        lambda: {
+            "status": "ok",
+            "open_positions": [
+                {
+                    "ticker": "TEST",
+                    "current_price_usd": 106,
+                    "stop_loss": 95,
+                    "target_1": 105,
+                    "target_2": 112,
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(main, "fetch_live_quote", lambda ticker: (104.0, "2026-06-18T14:00:00Z", 106.0, 103.0))
+
+    async def fake_dispatch(event, source="agent-ui-live-price"):
+        return {"github_status": 204, "workflow": "market-lens-position-monitor.yml", "ticker": event.ticker}
+
+    monkeypatch.setattr(main, "dispatch_position_monitor", fake_dispatch)
+
+    client = TestClient(main.app)
+    response = client.post(
+        "/agent/trigger-monitor",
+        json={"ticker": "TEST", "event_type": "TAKE_PARTIAL_PROFIT", "live_price": 106},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "triggered"
+    assert payload["triggered"] is True
+    assert payload["event_type"] == "TAKE_PARTIAL_PROFIT"
+    assert payload["live_price"] == 104.0
+    assert payload["live_high"] == 106.0
+    assert payload["live_low"] == 103.0
+
+
+def test_monitor_live_endpoint_requires_cron_secret_when_configured(monkeypatch) -> None:
+    reset_rate_limits()
+    monkeypatch.setenv("MARKET_LENS_MONITOR_CRON_SECRET", "secret-value")
+    monkeypatch.setattr(main, "build_agent_dashboard", lambda *_args, **_kwargs: {"status": "ok", "open_positions": []})
+
+    client = TestClient(main.app)
+    response = client.get("/agent/monitor-live")
+    assert response.status_code == 401
+
+    response = client.get("/agent/monitor-live?compact=false", headers={"X-Market-Lens-Cron-Secret": "secret-value"})
+    assert response.status_code == 200
+    assert response.json()["protected"] is True
+
+
+def test_monitor_live_endpoint_supports_tiny_cron_response(monkeypatch, tmp_path) -> None:
+    reset_rate_limits()
+    monkeypatch.delenv("MARKET_LENS_MONITOR_CRON_SECRET", raising=False)
+    snapshot_path = tmp_path / "agent_results" / "dashboard_snapshot.json"
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_text('{"status":"ok","open_positions":[]}', encoding="utf-8")
+    monkeypatch.setattr(main, "DASHBOARD_SNAPSHOT_PATH", snapshot_path)
+    monkeypatch.setattr(
+        main,
+        "sync_dashboard_snapshot_if_enabled",
+        lambda project_root: {"enabled": False, "reason": "disabled in test"},
+    )
+
+    client = TestClient(main.app)
+    response = client.get("/agent/monitor-live?compact=1")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert len(response.content) < 260
+    assert "status=skipped" in response.text
+    assert "triggered=false" in response.text
+
+
+def test_monitor_live_endpoint_defaults_to_tiny_cron_response(monkeypatch, tmp_path) -> None:
+    reset_rate_limits()
+    monkeypatch.delenv("MARKET_LENS_MONITOR_CRON_SECRET", raising=False)
+    snapshot_path = tmp_path / "agent_results" / "dashboard_snapshot.json"
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_text('{"status":"ok","open_positions":[]}', encoding="utf-8")
+    monkeypatch.setattr(main, "DASHBOARD_SNAPSHOT_PATH", snapshot_path)
+    monkeypatch.setattr(
+        main,
+        "sync_dashboard_snapshot_if_enabled",
+        lambda project_root: {"enabled": False, "reason": "disabled in test"},
+    )
+
+    client = TestClient(main.app)
+    response = client.get("/agent/monitor-live")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert len(response.content) < 260
+    assert "status=skipped" in response.text
+    assert "triggered=false" in response.text
+
+
+def test_monitor_live_endpoint_uses_lightweight_snapshot(monkeypatch, tmp_path) -> None:
+    reset_rate_limits()
+    monkeypatch.delenv("MARKET_LENS_MONITOR_CRON_SECRET", raising=False)
+    snapshot_path = tmp_path / "agent_results" / "dashboard_snapshot.json"
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_text('{"status":"ok","open_positions":[]}', encoding="utf-8")
+
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(main, "DASHBOARD_SNAPSHOT_PATH", snapshot_path)
+    monkeypatch.setattr(
+        main,
+        "sync_dashboard_snapshot_if_enabled",
+        lambda project_root: {"enabled": True, "downloaded": False, "project_root": str(project_root)},
+    )
+
+    def fail_build(*_args, **_kwargs):
+        raise AssertionError("monitor-live should not rebuild the full dashboard when a snapshot exists")
+
+    def fail_live_quote(*_args, **_kwargs):
+        raise AssertionError("monitor-live should not fetch live prices when the snapshot has no open positions")
+
+    monkeypatch.setattr(main, "build_agent_dashboard", fail_build)
+    monkeypatch.setattr(main, "fetch_live_quote", fail_live_quote)
+
+    client = TestClient(main.app)
+    response = client.get("/agent/monitor-live")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert "status=skipped" in response.text
+    assert "No open positions" in response.text
+
+
+def test_monitor_live_sends_near_tp_sl_attention_without_dispatch(monkeypatch, tmp_path) -> None:
+    reset_rate_limits()
+    monkeypatch.delenv("MARKET_LENS_MONITOR_CRON_SECRET", raising=False)
+    monkeypatch.setenv("MARKET_LENS_TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setenv("MARKET_LENS_TELEGRAM_CHAT_ID", "-100")
+    monkeypatch.setenv("MARKET_LENS_POSITION_ATTENTION_TELEGRAM_ENABLED", "true")
+    monkeypatch.setenv("MARKET_LENS_POSITION_ATTENTION_THRESHOLD_PCT", "1.0")
+    monkeypatch.setenv("MARKET_LENS_POSITION_ATTENTION_COOLDOWN_SECONDS", "0")
+    snapshot_path = tmp_path / "agent_results" / "dashboard_snapshot.json"
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "open_positions": [
+                    {
+                        "ticker": "TEST",
+                        "entry_price_usd": 100,
+                        "current_price_usd": 104,
+                        "stop_loss": 95,
+                        "target_1": 105,
+                        "target_2": 112,
+                        "chart_url": "/agent-results/charts/test.png",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    sent_notifications = []
+
+    async def fail_dispatch(*_args, **_kwargs):
+        raise AssertionError("near-threshold alerts must not dispatch GitHub monitor")
+
+    def fake_send(message, **kwargs):
+        sent_notifications.append((message, kwargs))
+        return types.SimpleNamespace(sent=True, status="sent")
+
+    monkeypatch.setattr(main, "DASHBOARD_SNAPSHOT_PATH", snapshot_path)
+    monkeypatch.setattr(
+        main,
+        "sync_dashboard_snapshot_if_enabled",
+        lambda project_root: {"enabled": False, "reason": "disabled in test"},
+    )
+    monkeypatch.setattr(main, "fetch_live_quote", lambda ticker: (104.0, "2026-06-18T14:00:00Z", 104.4, 103.6))
+    monkeypatch.setattr(main, "dispatch_position_monitor", fail_dispatch)
+    monkeypatch.setattr(main, "send_telegram_notification", fake_send)
+
+    client = TestClient(main.app)
+    response = client.get("/agent/monitor-live?compact=false")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered"] is False
+    assert payload["status"] == "ok"
+    assert payload["attention_alerts"][0]["event_type"] == "TAKE_PARTIAL_PROFIT"
+    assert payload["attention_alerts"][0]["sent"] is True
+    assert len(sent_notifications) == 1
+    message, kwargs = sent_notifications[0]
+    assert "no portfolio change yet" in message
+    assert kwargs["dedupe_key"].startswith("POSITION_ATTENTION|TEST|TAKE_PARTIAL_PROFIT")
+    assert kwargs["chart_ref"] == "/agent-results/charts/test.png"
+    assert kwargs["ticker"] == "TEST"
+
+
+def test_trigger_scan_endpoint_skips_without_dispatch_outside_scan_time(monkeypatch) -> None:
+    reset_rate_limits()
+    monkeypatch.delenv("MARKET_LENS_AGENT_CRON_SECRET", raising=False)
+    monkeypatch.setenv("GITHUB_ACTIONS_TRIGGER_TOKEN", "test-token")
+    monkeypatch.setattr(
+        main,
+        "scan_schedule_decision",
+        lambda force=False: ScanScheduleDecision(
+            should_run=False,
+            local_time="02:45",
+            local_date="2026-06-23",
+            local_weekday=2,
+            scan_key="2026-06-23T02:45",
+            reason="Outside configured New York scan times; GitHub Action dispatch skipped.",
+            next_scan_at="2026-06-23T06:30:00-04:00",
+        ),
+    )
+
+    async def fail_dispatch(*_args, **_kwargs):
+        raise AssertionError("dispatch should not be called")
+
+    monkeypatch.setattr(main, "dispatch_agent_scan", fail_dispatch)
+
+    client = TestClient(main.app)
+    response = client.get("/agent/trigger-scan?compact=false")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "skipped"
+    assert payload["triggered"] is False
+    assert payload["scan_key"] == "2026-06-23T02:45"
+
+
+def test_trigger_scan_endpoint_supports_tiny_cron_response(monkeypatch) -> None:
+    reset_rate_limits()
+    monkeypatch.delenv("MARKET_LENS_AGENT_CRON_SECRET", raising=False)
+    monkeypatch.setenv("GITHUB_ACTIONS_TRIGGER_TOKEN", "test-token")
+    monkeypatch.setattr(
+        main,
+        "scan_schedule_decision",
+        lambda force=False: ScanScheduleDecision(
+            should_run=False,
+            local_time="02:45",
+            local_date="2026-06-23",
+            local_weekday=2,
+            scan_key="2026-06-23T02:45",
+            reason="Outside configured New York scan times; GitHub Action dispatch skipped.",
+            next_scan_at="2026-06-23T06:30:00-04:00",
+        ),
+    )
+
+    async def fail_dispatch(*_args, **_kwargs):
+        raise AssertionError("dispatch should not be called")
+
+    monkeypatch.setattr(main, "dispatch_agent_scan", fail_dispatch)
+
+    client = TestClient(main.app)
+    response = client.get("/agent/trigger-scan?compact=1")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert len(response.content) < 260
+    assert "status=skipped" in response.text
+    assert "triggered=false" in response.text
+
+
+def test_trigger_scan_endpoint_defaults_to_tiny_cron_response(monkeypatch) -> None:
+    reset_rate_limits()
+    monkeypatch.delenv("MARKET_LENS_AGENT_CRON_SECRET", raising=False)
+    monkeypatch.setenv("GITHUB_ACTIONS_TRIGGER_TOKEN", "test-token")
+    monkeypatch.setattr(
+        main,
+        "scan_schedule_decision",
+        lambda force=False: ScanScheduleDecision(
+            should_run=False,
+            local_time="02:45",
+            local_date="2026-06-23",
+            local_weekday=2,
+            scan_key="2026-06-23T02:45",
+            reason="Outside configured New York scan times; GitHub Action dispatch skipped.",
+            next_scan_at="2026-06-23T06:30:00-04:00",
+        ),
+    )
+
+    async def fail_dispatch(*_args, **_kwargs):
+        raise AssertionError("dispatch should not be called")
+
+    monkeypatch.setattr(main, "dispatch_agent_scan", fail_dispatch)
+
+    client = TestClient(main.app)
+    response = client.get("/agent/trigger-scan")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert len(response.content) < 260
+    assert "status=skipped" in response.text
+    assert "triggered=false" in response.text
+
+
+def test_trigger_scan_endpoint_dispatches_once_at_scan_time(monkeypatch) -> None:
+    reset_rate_limits()
+    monkeypatch.setenv("GITHUB_ACTIONS_TRIGGER_TOKEN", "test-token")
+    monkeypatch.setenv("MARKET_LENS_AGENT_MAX_DAILY_DISPATCHES", "5")
+    monkeypatch.setenv("MARKET_LENS_AGENT_MIN_DISPATCH_INTERVAL_MINUTES", "0")
+    decision = ScanScheduleDecision(
+        should_run=True,
+        local_time="09:45",
+        local_date="2026-06-23",
+        local_weekday=2,
+        scan_key="2026-06-23T09:45",
+        reason="Current New York time matches a configured agent scan slot.",
+        next_scan_at="2026-06-23T10:30:00-04:00",
+    )
+    monkeypatch.setattr(main, "scan_schedule_decision", lambda force=False: decision)
+    dispatches = []
+
+    async def fake_dispatch(source="agent-server-scan-scheduler"):
+        dispatches.append(source)
+        return {"github_status": 204, "workflow": "market-lens-agent.yml"}
+
+    monkeypatch.setattr(main, "dispatch_agent_scan", fake_dispatch)
+
+    client = TestClient(main.app)
+    first = client.post("/agent/trigger-scan?compact=false")
+    second = client.post("/agent/trigger-scan?compact=false")
+
+    assert first.status_code == 200
+    assert first.json()["status"] == "triggered"
+    assert first.json()["triggered"] is True
+    assert second.status_code == 200
+    assert second.json()["status"] == "skipped"
+    assert second.json()["triggered"] is False
+    assert dispatches == ["agent-server-scan-scheduler"]
+
+
+def test_trigger_scan_endpoint_respects_daily_dispatch_budget(monkeypatch) -> None:
+    reset_rate_limits()
+    monkeypatch.setenv("GITHUB_ACTIONS_TRIGGER_TOKEN", "test-token")
+    monkeypatch.setenv("MARKET_LENS_AGENT_MAX_DAILY_DISPATCHES", "1")
+    monkeypatch.setenv("MARKET_LENS_AGENT_MIN_DISPATCH_INTERVAL_MINUTES", "0")
+    decisions = iter([
+        ScanScheduleDecision(
+            should_run=True,
+            local_time="09:45",
+            local_date="2026-06-23",
+            local_weekday=2,
+            scan_key="2026-06-23T09:45",
+            reason="Current New York time is inside the 09:45 scan dispatch window.",
+            next_scan_at="2026-06-23T11:30:00-04:00",
+        ),
+        ScanScheduleDecision(
+            should_run=True,
+            local_time="11:30",
+            local_date="2026-06-23",
+            local_weekday=2,
+            scan_key="2026-06-23T11:30",
+            reason="Current New York time is inside the 11:30 scan dispatch window.",
+            next_scan_at="2026-06-23T14:30:00-04:00",
+        ),
+    ])
+    monkeypatch.setattr(main, "scan_schedule_decision", lambda force=False: next(decisions))
+    dispatches = []
+
+    async def fake_dispatch(source="agent-server-scan-scheduler"):
+        dispatches.append(source)
+        return {"github_status": 204, "workflow": "market-lens-agent.yml"}
+
+    monkeypatch.setattr(main, "dispatch_agent_scan", fake_dispatch)
+
+    client = TestClient(main.app)
+    first = client.post("/agent/trigger-scan?compact=false")
+    second = client.post("/agent/trigger-scan?compact=false")
+
+    assert first.status_code == 200
+    assert first.json()["triggered"] is True
+    assert second.status_code == 200
+    assert second.json()["triggered"] is False
+    assert second.json()["status"] == "skipped"
+    assert "Daily GitHub Actions scan budget reached" in second.json()["reason"]
+    assert dispatches == ["agent-server-scan-scheduler"]
+
+
+def test_scan_dispatch_budget_is_disabled_by_default(monkeypatch) -> None:
+    reset_rate_limits()
+    monkeypatch.delenv("MARKET_LENS_AGENT_MAX_DAILY_DISPATCHES", raising=False)
+    monkeypatch.delenv("MARKET_LENS_AGENT_MIN_DISPATCH_INTERVAL_MINUTES", raising=False)
+
+    scan_trigger.mark_scan_dispatched("2026-06-23T09:45")
+    scan_trigger.mark_scan_dispatched("2026-06-23T10:00")
+
+    assert scan_trigger.scan_dispatch_budget_reason("2026-06-23T10:30") == ""
+
+
+def test_trigger_scan_endpoint_respects_dispatch_cooldown(monkeypatch) -> None:
+    reset_rate_limits()
+    monkeypatch.setenv("GITHUB_ACTIONS_TRIGGER_TOKEN", "test-token")
+    monkeypatch.setenv("MARKET_LENS_AGENT_MAX_DAILY_DISPATCHES", "5")
+    monkeypatch.setenv("MARKET_LENS_AGENT_MIN_DISPATCH_INTERVAL_MINUTES", "120")
+    decisions = iter([
+        ScanScheduleDecision(
+            should_run=True,
+            local_time="09:45",
+            local_date="2026-06-23",
+            local_weekday=2,
+            scan_key="2026-06-23T09:45",
+            reason="Current New York time is inside the 09:45 scan dispatch window.",
+            next_scan_at="2026-06-23T11:30:00-04:00",
+        ),
+        ScanScheduleDecision(
+            should_run=True,
+            local_time="11:30",
+            local_date="2026-06-23",
+            local_weekday=2,
+            scan_key="2026-06-23T11:30",
+            reason="Current New York time is inside the 11:30 scan dispatch window.",
+            next_scan_at="2026-06-23T14:30:00-04:00",
+        ),
+    ])
+    monkeypatch.setattr(main, "scan_schedule_decision", lambda force=False: next(decisions))
+    dispatches = []
+
+    async def fake_dispatch(source="agent-server-scan-scheduler"):
+        dispatches.append(source)
+        return {"github_status": 204, "workflow": "market-lens-agent.yml"}
+
+    monkeypatch.setattr(main, "dispatch_agent_scan", fake_dispatch)
+
+    client = TestClient(main.app)
+    first = client.post("/agent/trigger-scan?compact=false")
+    second = client.post("/agent/trigger-scan?compact=false")
+
+    assert first.status_code == 200
+    assert first.json()["triggered"] is True
+    assert second.status_code == 200
+    assert second.json()["triggered"] is False
+    assert second.json()["status"] == "skipped"
+    assert "scan cooldown is active" in second.json()["reason"]
+    assert dispatches == ["agent-server-scan-scheduler"]
+
+
+def test_trigger_scan_endpoint_returns_compact_dispatch_payload(monkeypatch) -> None:
+    reset_rate_limits()
+    monkeypatch.setenv("GITHUB_ACTIONS_TRIGGER_TOKEN", "test-token")
+    monkeypatch.setenv("MARKET_LENS_AGENT_MAX_DAILY_DISPATCHES", "5")
+    monkeypatch.setenv("MARKET_LENS_AGENT_MIN_DISPATCH_INTERVAL_MINUTES", "0")
+    decision = ScanScheduleDecision(
+        should_run=True,
+        local_time="09:45",
+        local_date="2026-06-23",
+        local_weekday=2,
+        scan_key="2026-06-23T09:45",
+        reason="Current New York time matches a configured agent scan slot.",
+        next_scan_at="2026-06-23T10:30:00-04:00",
+    )
+    monkeypatch.setattr(main, "scan_schedule_decision", lambda force=False: decision)
+
+    async def fake_dispatch(source="agent-server-scan-scheduler"):
+        return {
+            "github_status": 204,
+            "workflow": "market-lens-agent.yml",
+            "ref": "main",
+            "repo": "AviramDahan/market-lens-scanner",
+            "source": source,
+            "raw_response": "x" * 100_000,
+        }
+
+    monkeypatch.setattr(main, "dispatch_agent_scan", fake_dispatch)
+
+    client = TestClient(main.app)
+    response = client.post("/agent/trigger-scan?compact=false")
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert len(response.content) < 1_000
+    assert payload["status"] == "triggered"
+    assert payload["dispatch"] == {
+        "github_status": 204,
+        "workflow": "market-lens-agent.yml",
+        "ref": "main",
+        "repo": "AviramDahan/market-lens-scanner",
+        "source": "agent-server-scan-scheduler",
+    }
+
+
+def test_trigger_scan_force_query_is_ignored_by_default(monkeypatch) -> None:
+    reset_rate_limits()
+    monkeypatch.delenv("MARKET_LENS_ALLOW_TRIGGER_SCAN_FORCE", raising=False)
+    monkeypatch.setenv("GITHUB_ACTIONS_TRIGGER_TOKEN", "test-token")
+    force_values = []
+
+    def fake_decision(force=False):
+        force_values.append(force)
+        return ScanScheduleDecision(
+            should_run=False,
+            local_time="02:45",
+            local_date="2026-06-23",
+            local_weekday=2,
+            scan_key="2026-06-23T02:45",
+            reason="Outside configured New York scan times; GitHub Action dispatch skipped.",
+            next_scan_at="2026-06-23T06:30:00-04:00",
+        )
+
+    async def fail_dispatch(*_args, **_kwargs):
+        raise AssertionError("dispatch should not be called")
+
+    monkeypatch.setattr(main, "scan_schedule_decision", fake_decision)
+    monkeypatch.setattr(main, "dispatch_agent_scan", fail_dispatch)
+
+    client = TestClient(main.app)
+    response = client.get("/agent/trigger-scan?force=true&compact=false")
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert payload["status"] == "skipped"
+    assert payload["force_requested"] is True
+    assert payload["force_applied"] is False
+    assert force_values == [False]
+
+
+def test_trigger_scan_endpoint_requires_agent_cron_secret_when_configured(monkeypatch) -> None:
+    reset_rate_limits()
+    monkeypatch.setenv("MARKET_LENS_AGENT_CRON_SECRET", "scan-secret")
+    client = TestClient(main.app)
+
+    response = client.get("/agent/trigger-scan")
+    assert response.status_code == 401
+
+    response = client.get("/agent/trigger-scan?compact=false", headers={"X-Market-Lens-Cron-Secret": "scan-secret"})
+    assert response.status_code == 200
+    assert response.json()["protected"] is True
+
+
+def test_scan_schedule_allows_short_cold_start_window(monkeypatch) -> None:
+    monkeypatch.setenv("MARKET_LENS_AGENT_TRIGGER_WINDOW_MINUTES", "4")
+
+    decision = scan_trigger.scan_schedule_decision(
+        now=datetime.fromisoformat("2026-06-23T09:47:00-04:00"),
+    )
+
+    assert decision.should_run is True
+    assert decision.scan_key == "2026-06-23T09:45"
+
+
+def test_scan_schedule_includes_midday_slot(monkeypatch) -> None:
+    monkeypatch.setenv("MARKET_LENS_AGENT_TRIGGER_WINDOW_MINUTES", "4")
+
+    decision = scan_trigger.scan_schedule_decision(
+        now=datetime.fromisoformat("2026-06-23T12:02:00-04:00"),
+    )
+
+    assert decision.should_run is True
+    assert decision.scan_key == "2026-06-23T12:00"
+
+
+def test_scan_schedule_includes_after_market_slots(monkeypatch) -> None:
+    monkeypatch.setenv("MARKET_LENS_AGENT_TRIGGER_WINDOW_MINUTES", "4")
+
+    decision = scan_trigger.scan_schedule_decision(
+        now=datetime.fromisoformat("2026-06-23T19:32:00-04:00"),
+    )
+
+    assert decision.should_run is True
+    assert decision.scan_key == "2026-06-23T19:30"
+
+
+def test_scan_schedule_includes_premarket_slot(monkeypatch) -> None:
+    monkeypatch.setenv("MARKET_LENS_AGENT_TRIGGER_WINDOW_MINUTES", "4")
+
+    decision = scan_trigger.scan_schedule_decision(
+        now=datetime.fromisoformat("2026-06-23T02:33:00-04:00"),
+    )
+
+    assert decision.should_run is True
+    assert decision.scan_key == "2026-06-23T02:30"
+
+
+def test_scan_schedule_times_can_be_overridden_by_env(monkeypatch) -> None:
+    monkeypatch.setenv("MARKET_LENS_AGENT_WEEKDAY_SCAN_TIMES", "10:07")
+    monkeypatch.setenv("MARKET_LENS_AGENT_TRIGGER_WINDOW_MINUTES", "4")
+
+    inside = scan_trigger.scan_schedule_decision(
+        now=datetime.fromisoformat("2026-06-23T10:09:00-04:00")
+    )
+    outside = scan_trigger.scan_schedule_decision(
+        now=datetime.fromisoformat("2026-06-23T09:45:00-04:00")
+    )
+
+    assert inside.should_run is True
+    assert inside.scan_key == "2026-06-23T10:07"
+    assert outside.should_run is False
+
+
+def test_smart_universe_endpoint_returns_fallback_on_error(monkeypatch) -> None:
+    def broken_smart_universe(**_kwargs):
+        raise RuntimeError("source unavailable")
+
+    monkeypatch.setattr(main, "build_smart_universe", broken_smart_universe)
+
+    client = TestClient(main.app)
+    response = client.get("/smart-universe?limit=10&max_per_sector=3&analysis_period=6mo")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["fallback"] is True
+    assert payload["count"] > 0
+    assert payload["companies"]
+
+
+def test_smart_universe_cold_start_uses_longer_default_budget(monkeypatch) -> None:
+    monkeypatch.delenv("MARKET_LENS_SMART_UNIVERSE_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setattr(main, "build_smart_universe", lambda **_kwargs: {"count": 1})
+    original_wait_for = asyncio.wait_for
+    observed = []
+
+    async def capture_wait_for(task, timeout):
+        observed.append(timeout)
+        return await original_wait_for(task, timeout)
+
+    monkeypatch.setattr(main.asyncio, "wait_for", capture_wait_for)
+    assert asyncio.run(main.get_smart_universe(limit=35, max_per_sector=5, analysis_period="6mo")) == {"count": 1}
+    assert observed == [70.0]
+
+
+def test_snapshot_enrichment_refreshes_stale_setup_selection_diagnostics(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(main, "AGENT_RESULTS_DIR", tmp_path / "agent_results")
+    dashboard = {
+        "status": "ok",
+        "latest_setups": [
+            {
+                "ticker": "AAA",
+                "company_name": "Alpha Corp",
+                "sector": "Technology",
+                "action": "WATCH_READY",
+                "setup_type": "Fib 61.8 Confluence Buy Zone",
+                "score": 0.55,
+                "risk_reward": 2.4,
+                "decision_json": {
+                    "active_setup_selection_policy": "FIRST_MATCH_LEGACY",
+                    "final_action": "WATCH_READY",
+                    "setup_type": "Fib 61.8 Confluence Buy Zone",
+                    "setup_candidates": [
+                        {
+                            "setup_type": "Fib 61.8 Confluence Buy Zone",
+                            "legacy_score": 0.4,
+                            "shadow_setup_normalized_score": 0.5,
+                        },
+                        {
+                            "setup_type": "VWAP Reclaim Setup",
+                            "legacy_score": 0.3,
+                            "shadow_setup_normalized_score": 0.45,
+                        },
+                    ],
+                },
+            }
+        ],
+        "decision_diagnostics": {
+            "drilldowns": {"WATCH_READY": [{"ticker": "AAA"}]},
+            "why_no_buys": [],
+            "watch_ready_funnel": {},
+            "entry_blockers_summary": [],
+            "closest_to_entry": [],
+        },
+        "open_positions": [],
+        "summary": {},
+        "recent_trades": [],
+        "latest_decisions": [],
+        "risk_dashboard": {},
+        "position_timeline": [],
+        "daily_summary": {},
+        "weekly_summary": {},
+        "system_health": {},
+    }
+
+    enriched = main.enrich_agent_dashboard_snapshot(dashboard)
+    item = enriched["decision_diagnostics"]["drilldowns"]["WATCH_READY"][0]
+
+    assert item["active_setup_selection_policy"] == "FIRST_MATCH_LEGACY"
+    assert item["setup_candidate_count"] == 2
+    assert item["setup_candidates"][0]["is_active"] is True
+    assert item["setup_candidates"][1]["is_active"] is False
+
+
+def test_diagnostic_chart_endpoint_generates_only_for_current_diagnostic(monkeypatch, tmp_path) -> None:
+    class FakeResult:
+        ticker = "AAA"
+        setup_type = "VWAP Reclaim"
+        score = 0.5
+        current_price = 100
+        risk_reward = 2
+
+        def model_copy(self, update=None):
+            for key, value in (update or {}).items():
+                setattr(self, key, value)
+            return self
+
+    monkeypatch.setattr(main, "AGENT_RESULTS_DIR", tmp_path / "agent_results")
+    monkeypatch.setattr(main, "DASHBOARD_SNAPSHOT_PATH", tmp_path / "agent_results" / "dashboard_snapshot.json")
+    monkeypatch.setattr(main, "CHART_DIR", tmp_path / "charts")
+    main.AGENT_RESULTS_DIR.mkdir()
+    main.DASHBOARD_SNAPSHOT_PATH.write_bytes(b'{"status":"ok","summary":{"cash_ils":100000}}')
+    original_snapshot = main.DASHBOARD_SNAPSHOT_PATH.read_bytes()
+    calls = []
+
+    def no_snapshot_write(*_args):
+        raise AssertionError("UI chart generation must not update portfolio state")
+
+    monkeypatch.setattr(main, "attach_diagnostic_chart_to_snapshot", no_snapshot_write)
+    monkeypatch.setattr(
+        main,
+        "current_agent_dashboard",
+        lambda: {
+            "status": "ok",
+            "latest_run": {"run_id": "test-run"},
+            "decision_diagnostics": {
+                "drilldowns": {
+                    "WATCH_READY": [
+                        {
+                            "ticker": "AAA",
+                            "setup_type": "VWAP Reclaim",
+                            "setup_score": 0.5,
+                            "current_price_usd": 100,
+                            "buy_zone_low": 98,
+                            "buy_zone_high": 102,
+                            "stop_loss": 95,
+                            "target_1": 108,
+                            "target_2": 115,
+                        }
+                    ]
+                }
+            },
+        },
+    )
+    def fake_scan(*_args, **_kwargs):
+        calls.append("scan")
+        return types.SimpleNamespace(result=FakeResult())
+
+    monkeypatch.setattr(main, "scan_ticker_detail", fake_scan)
+
+    def fake_write_chart(_detail, output_dir):
+        assert output_dir == main.CHART_DIR / "agent-diagnostics"
+        path = output_dir / "aaa-scan.png"
+        path.write_bytes(b"png")
+        return path
+
+    monkeypatch.setattr(main, "write_scan_chart", fake_write_chart)
+
+    client = TestClient(main.app)
+    response = client.post("/agent/diagnostic-chart?ticker=AAA&diagnostic_key=WATCH_READY")
+    blocked = client.post("/agent/diagnostic-chart?ticker=BBB&diagnostic_key=WATCH_READY")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["generated"] is True
+    assert payload["chart_url"].startswith("/charts/agent-diagnostics/market_lens_diagnostic_test-run_aaa")
+    assert (tmp_path / "charts" / "agent-diagnostics" / "market_lens_diagnostic_test-run_aaa.png").exists()
+    assert payload["persistence"] == "ephemeral_diagnostic_cache"
+    assert blocked.status_code == 404
+    chart_static = next(route.app for route in main.app.routes if route.name == "charts")
+    monkeypatch.setattr(chart_static, "directory", str(main.CHART_DIR))
+    monkeypatch.setattr(chart_static, "all_directories", [str(main.CHART_DIR)])
+    image_response = client.get(payload["chart_url"])
+    assert image_response.status_code == 200
+    assert image_response.headers["content-type"] == "image/png"
+    assert image_response.content == b"png"
+    repeated = client.post("/agent/diagnostic-chart?ticker=AAA&diagnostic_key=WATCH_READY")
+    assert repeated.status_code == 200
+    assert repeated.json()["generated"] is False
+    assert calls == ["scan"]
+    assert main.DASHBOARD_SNAPSHOT_PATH.read_bytes() == original_snapshot
+    assert not (main.AGENT_RESULTS_DIR / "charts").exists()
+
+
+def test_diagnostic_chart_cache_failure_is_explicit_without_snapshot_write(monkeypatch, tmp_path) -> None:
+    cache = tmp_path / "charts"
+    cache.mkdir()
+    (cache / "agent-diagnostics").write_text("not a writable directory")
+    monkeypatch.setattr(main, "CHART_DIR", cache)
+    monkeypatch.setattr(main, "current_agent_dashboard", lambda: {
+        "status": "ok", "latest_run": {"run_id": "test"},
+        "decision_diagnostics": {"drilldowns": {"WATCH_READY": [{"ticker": "AAA"}]}},
+    })
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("No scan or snapshot write after cache failure")
+
+    monkeypatch.setattr(main, "scan_ticker_detail", unexpected)
+    monkeypatch.setattr(main, "attach_diagnostic_chart_to_snapshot", unexpected)
+    response = TestClient(main.app).post("/agent/diagnostic-chart?ticker=AAA")
+    assert response.status_code == 502
+    assert "Chart generation failed" in response.json()["detail"]
+
+
+def test_diagnostic_chart_reuses_retained_original_without_new_scan(monkeypatch, tmp_path) -> None:
+    saved = tmp_path / "agent_results/charts/original.png"
+    saved.parent.mkdir(parents=True)
+    saved.write_bytes(b"original chart")
+    monkeypatch.setattr(main, "AGENT_RESULTS_DIR", tmp_path / "agent_results")
+    monkeypatch.setattr(main, "current_agent_dashboard", lambda: {
+        "status": "ok", "latest_run": {"run_id": "test"},
+        "decision_diagnostics": {"drilldowns": {"WATCH_READY": [{"ticker": "AAA", "chart_url": "/agent-results/charts/original.png"}]}},
+    })
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("Retained charts must not be regenerated or rewritten")
+
+    monkeypatch.setattr(main, "scan_ticker_detail", unexpected)
+    monkeypatch.setattr(main, "attach_diagnostic_chart_to_snapshot", unexpected)
+    response = TestClient(main.app).post("/agent/diagnostic-chart?ticker=AAA")
+    assert response.status_code == 200
+    assert response.json()["generated"] is False
+    assert response.json()["chart_url"] == "/agent-results/charts/original.png"
+    assert saved.read_bytes() == b"original chart"
+
+
+def test_monitor_live_endpoint_dispatches_once_when_any_position_touches_target(monkeypatch, tmp_path) -> None:
+    reset_rate_limits()
+    monkeypatch.delenv("MARKET_LENS_MONITOR_CRON_SECRET", raising=False)
+    monkeypatch.setenv("GITHUB_ACTIONS_TRIGGER_TOKEN", "test-token")
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(main, "DASHBOARD_SNAPSHOT_PATH", tmp_path / "agent_results" / "dashboard_snapshot.json")
+    monkeypatch.setattr(
+        main,
+        "sync_dashboard_snapshot_if_enabled",
+        lambda project_root: {"enabled": False, "reason": "disabled in test"},
+    )
+    monkeypatch.setattr(
+        main,
+        "build_agent_dashboard",
+        lambda *_args, **_kwargs: {
+            "status": "ok",
+            "open_positions": [
+                {"ticker": "AAA", "stop_loss": 95, "target_1": 105, "target_2": 112},
+                {"ticker": "BBB", "stop_loss": 45, "target_1": 55, "target_2": 60},
+            ],
+        },
+    )
+
+    def fake_live_quote(ticker):
+        prices = {
+            "AAA": (100.0, "2026-06-18T14:00:00Z", 100.2, 99.8),
+            "BBB": (54.5, "2026-06-18T14:00:00Z", 55.5, 54.0),
+        }
+        return prices[ticker]
+
+    monkeypatch.setattr(main, "fetch_live_quote", fake_live_quote)
+    dispatches = []
+
+    async def fake_dispatch(event, source="agent-ui-live-price"):
+        dispatches.append((event.ticker, event.event_type, source))
+        return {"github_status": 204, "workflow": "market-lens-position-monitor.yml", "ticker": event.ticker}
+
+    monkeypatch.setattr(main, "dispatch_position_monitor", fake_dispatch)
+
+    client = TestClient(main.app)
+    response = client.post("/agent/monitor-live?compact=false")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "triggered"
+    assert payload["triggered"] is True
+    assert payload["positions_checked"] == 2
+    assert payload["dispatched_event"]["ticker"] == "BBB"
+    assert dispatches == [("BBB", "TAKE_PARTIAL_PROFIT", "agent-server-live-monitor")]

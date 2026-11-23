@@ -1,0 +1,374 @@
+from __future__ import annotations
+
+import io
+import json
+from types import SimpleNamespace
+
+import pytest
+from fastapi.testclient import TestClient
+from openpyxl import Workbook
+
+import app.main as main
+from agent import production_smoke
+from agent.production_smoke import (
+    ProductionSmoke,
+    SmokeFailure,
+    decision_jsonl_url,
+    revisions_match,
+    validate_chart,
+    validate_dashboard,
+    validate_decision_jsonl,
+    validate_health,
+    validate_host_monitor_source,
+    validate_monitor_state,
+    validate_render_shadow_monitor,
+    validate_read_only_scan,
+    validate_tracker,
+)
+from app.models import ScanResult
+
+
+def test_health_exposes_render_revision_without_requiring_it(monkeypatch) -> None:
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "abc123def456")
+
+    response = TestClient(main.app).get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "revision": "abc123def456"}
+
+
+def test_read_only_ui_scan_generates_chart_without_persisting(monkeypatch, tmp_path) -> None:
+    result = ScanResult(
+        ticker="MSFT",
+        setup_type="No Trade",
+        score=0.0,
+        current_price=100.0,
+        buy_zone=(0.0, 0.0),
+        stop_loss=0.0,
+        target_1=0.0,
+        target_2=0.0,
+        risk_reward=0.0,
+        reason="Smoke fixture",
+    )
+    detail = SimpleNamespace(result=result)
+    monkeypatch.setenv("MARKET_LENS_AUTH_MODE", "open")
+    monkeypatch.setattr(main, "CHART_DIR", tmp_path)
+    monkeypatch.setattr(main, "scan_tickers", lambda *_args, **_kwargs: ([result], {}, [detail]))
+    monkeypatch.setattr(main, "apply_strategy_decisions", lambda results, **_kwargs: results)
+
+    def fake_chart(_detail, output_dir):
+        path = output_dir / "msft.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 2_000)
+        return path
+
+    monkeypatch.setattr(main, "write_scan_chart", fake_chart)
+    monkeypatch.setattr(
+        main,
+        "save_setup",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("read-only smoke must not persist a setup")
+        ),
+    )
+
+    response = TestClient(main.app).post(
+        "/ui/scan",
+        json={
+            "tickers": ["MSFT"],
+            "include_charts": True,
+            "persist_setups": False,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["saved_setups"] == []
+    assert payload["charts"] == {"MSFT": "/charts/msft.png"}
+
+
+def test_ui_scan_keeps_existing_persistence_default(monkeypatch) -> None:
+    result = ScanResult(
+        ticker="MSFT",
+        setup_type="Breakout + Retest",
+        score=0.7,
+        current_price=100.0,
+        buy_zone=(99.0, 101.0),
+        stop_loss=95.0,
+        target_1=110.0,
+        target_2=120.0,
+        risk_reward=2.5,
+        reason="Persistence fixture",
+    )
+    detail = SimpleNamespace(result=result)
+    saved = []
+    monkeypatch.setenv("MARKET_LENS_AUTH_MODE", "open")
+    monkeypatch.setattr(main, "scan_tickers", lambda *_args, **_kwargs: ([result], {}, [detail]))
+    monkeypatch.setattr(main, "apply_strategy_decisions", lambda results, **_kwargs: results)
+
+    def fake_save_setup(saved_result, **_kwargs):
+        saved.append(saved_result.ticker)
+        return {"ticker": saved_result.ticker}
+
+    monkeypatch.setattr(main, "save_setup", fake_save_setup)
+
+    response = TestClient(main.app).post(
+        "/ui/scan",
+        json={"tickers": ["MSFT"], "include_charts": False},
+    )
+
+    assert response.status_code == 200
+    assert saved == ["MSFT"]
+    assert response.json()["saved_setups"] == [{"ticker": "MSFT"}]
+
+
+def test_revision_matching_accepts_full_and_short_hashes() -> None:
+    assert revisions_match("abcdef1234567890", "abcdef123456")
+    assert revisions_match("abcdef123456", "abcdef1234567890")
+    assert not revisions_match("abcdef123456", "999999123456")
+
+
+def test_health_validation_waits_for_expected_revision() -> None:
+    validate_health({"status": "ok", "revision": "abcdef1234567890"}, "abcdef123456")
+
+    with pytest.raises(SmokeFailure, match="does not match"):
+        validate_health({"status": "ok", "revision": "old"}, "abcdef123456")
+
+
+def test_dashboard_validation_rejects_fake_zero_and_fatal_markers() -> None:
+    healthy = {
+        "status": "ok",
+        "latest_run": {
+            "run_id": "run-1",
+            "run_status": "PARTIAL_OK",
+            "scan_coverage": {"received": 133, "requested": 136},
+            "summary_text": "Run status: PARTIAL_OK",
+        },
+    }
+    assert "results=133" in validate_dashboard(healthy)
+
+    complete = json.loads(json.dumps(healthy))
+    complete["latest_run"]["run_status"] = "COMPLETE"
+    assert "status=COMPLETE" in validate_dashboard(complete)
+
+    zero = json.loads(json.dumps(healthy))
+    zero["latest_run"]["scan_coverage"]["received"] = 0
+    with pytest.raises(SmokeFailure, match="zero result"):
+        validate_dashboard(zero)
+
+    fatal = json.loads(json.dumps(healthy))
+    fatal["latest_run"]["summary_text"] = "AUTH_FAILED"
+    with pytest.raises(SmokeFailure, match="fatal run marker"):
+        validate_dashboard(fatal)
+
+
+def test_decision_jsonl_validation_requires_unique_complete_records() -> None:
+    body = (
+        json.dumps({"ticker": "MSFT", "final_action": "SKIP", "reason": "No setup"})
+        + "\n"
+        + json.dumps({"ticker": "NVDA", "final_action": "WATCH", "reason": "Waiting"})
+        + "\n"
+    ).encode()
+    assert validate_decision_jsonl(body) == 2
+
+    duplicate = body + (
+        json.dumps({"ticker": "MSFT", "final_action": "SKIP", "reason": "Again"}) + "\n"
+    ).encode()
+    with pytest.raises(SmokeFailure, match="duplicate ticker"):
+        validate_decision_jsonl(duplicate)
+
+
+def test_decision_url_uses_safe_explicit_path_or_run_id_fallback() -> None:
+    explicit = "/agent-results/decisions/custom.jsonl"
+    assert decision_jsonl_url({"decision_jsonl_url": explicit}) == explicit
+    assert decision_jsonl_url({"run_id": "20260924_113146"}) == (
+        "/agent-results/decisions/market_lens_agent_20260924_113146.jsonl"
+    )
+    with pytest.raises(SmokeFailure, match="safe Decision"):
+        decision_jsonl_url({"run_id": "../../secret"})
+
+
+def test_tracker_validation_opens_required_sheets() -> None:
+    workbook = Workbook()
+    workbook.active.title = "Dashboard"
+    for title in ("Trade Log", "Open Positions", "Position Events"):
+        workbook.create_sheet(title)
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+
+    sheets = validate_tracker(buffer.getvalue())
+
+    assert set(("Dashboard", "Trade Log", "Open Positions", "Position Events")) <= set(sheets)
+
+
+def test_read_only_scan_and_chart_contracts() -> None:
+    chart_url = validate_read_only_scan(
+        {
+            "results": [{"ticker": "MSFT"}],
+            "errors": {},
+            "charts": {"MSFT": "/charts/msft.png"},
+            "saved_setups": [],
+        },
+        "MSFT",
+    )
+    assert chart_url == "/charts/msft.png"
+    validate_chart(
+        b"\x89PNG\r\n\x1a\n" + b"x" * 2_000,
+        {"content-type": "image/png"},
+    )
+
+    with pytest.raises(SmokeFailure, match="persisted"):
+        validate_read_only_scan(
+            {
+                "results": [{"ticker": "MSFT"}],
+                "charts": {"MSFT": "/charts/msft.png"},
+                "saved_setups": [{"ticker": "MSFT"}],
+            },
+            "MSFT",
+        )
+
+
+def test_monitor_validation_is_read_only_and_accepts_off_hours_history() -> None:
+    payload = {
+        "system_health": {
+            "price_sensor_status": "NOT_DUE_OUTSIDE_REGULAR_SESSION",
+            "execution_sensor_status": "NOT_DUE_OUTSIDE_REGULAR_SESSION",
+            "executor_persistence_status": "NOT_TRIGGERED",
+            "latest_monitor_status": "MONITOR_OK",
+            "latest_monitor_positions_checked": 5,
+            "latest_monitor_positions_failed": 0,
+            "latest_monitor_event_count": 0,
+            "latest_monitor_age_minutes": 500,
+        }
+    }
+    detail = validate_monitor_state(payload, max_age_minutes=0)
+    assert "persistence=NOT_TRIGGERED" in detail
+    assert "events=0" in detail
+
+    with pytest.raises(SmokeFailure, match="failed position"):
+        payload["system_health"]["latest_monitor_positions_failed"] = 1
+        validate_monitor_state(payload, max_age_minutes=0)
+
+
+def test_monitor_validation_rejects_shadow_only_and_unpersisted_dispatch() -> None:
+    payload = {
+        "system_health": {
+            "price_sensor_status": "CURRENT",
+            "execution_sensor_status": "NOT_OBSERVED",
+            "executor_persistence_status": "NOT_TRIGGERED",
+            "latest_monitor_positions_failed": 0,
+        }
+    }
+    with pytest.raises(SmokeFailure, match="Active TP/SL sensor"):
+        validate_monitor_state(payload, max_age_minutes=3)
+
+    payload["system_health"].update(
+        {
+            "execution_sensor_status": "CURRENT",
+            "execution_sensor_check_age_minutes": 1,
+            "executor_persistence_status": "STALE",
+        }
+    )
+    with pytest.raises(SmokeFailure, match="persisted executor"):
+        validate_monitor_state(payload, max_age_minutes=3)
+
+
+def test_render_shadow_smoke_requires_running_read_only_journal() -> None:
+    healthy = {
+        "mode": "shadow",
+        "side_effects_enabled": False,
+        "enabled": True,
+        "running": True,
+        "status": "ok",
+        "total_polls": 12,
+        "total_unique_events": 1,
+        "event_journal_limit": 100,
+        "event_journal": [],
+    }
+
+    assert "side_effects=false" in validate_render_shadow_monitor(healthy)
+
+    unsafe = {**healthy, "side_effects_enabled": True}
+    with pytest.raises(SmokeFailure, match="side effects"):
+        validate_render_shadow_monitor(unsafe)
+
+    stopped = {**healthy, "running": False}
+    with pytest.raises(SmokeFailure, match="not enabled and running"):
+        validate_render_shadow_monitor(stopped)
+
+
+def test_host_smoke_requires_active_writer_not_legacy_sensor() -> None:
+    payload = {"system_health": {
+        "execution_sensor_source": "host_writer",
+        "price_sensor_mode": "host_writer",
+        "executor_persistence_status": "NOT_TRIGGERED",
+    }}
+    assert "source=host_writer" in validate_host_monitor_source(payload)
+    payload["system_health"]["execution_sensor_source"] = "github_actions"
+    with pytest.raises(SmokeFailure, match="host position writer"):
+        validate_host_monitor_source(payload)
+    payload["system_health"]["execution_sensor_source"] = "host_writer"
+    payload["system_health"]["executor_persistence_status"] = "PENDING"
+    with pytest.raises(SmokeFailure, match="persistence receipt"):
+        validate_host_monitor_source(payload)
+    payload["system_health"]["executor_persistence_status"] = ""
+    with pytest.raises(SmokeFailure, match="missing or invalid"):
+        validate_host_monitor_source(payload)
+
+
+def test_host_smoke_rechecks_transient_stale_heartbeat(monkeypatch) -> None:
+    smoke = ProductionSmoke()
+    smoke.monitor_wait_seconds = 1
+    smoke.monitor_max_age_minutes = 3
+    smoke.dashboard = {"system_health": {
+        "price_sensor_status": "STALE",
+        "execution_sensor_status": "STALE",
+    }}
+    fresh = {"system_health": {
+        "price_sensor_status": "CURRENT",
+        "execution_sensor_status": "CURRENT",
+        "execution_sensor_source": "host_writer",
+        "price_sensor_mode": "host_writer",
+        "executor_persistence_status": "NOT_TRIGGERED",
+        "latest_monitor_status": "MONITOR_OK",
+        "latest_monitor_positions_checked": 1,
+        "latest_monitor_positions_failed": 0,
+    }}
+    monkeypatch.setattr(production_smoke.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(smoke, "request_json", lambda path, **_kwargs: fresh)
+    assert "execution=CURRENT" in smoke.check_monitor_state()
+
+
+def test_dashboard_snapshot_enrichment_overlays_synced_monitor_heartbeat(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    heartbeat_dir = tmp_path / "position_monitor"
+    heartbeat_dir.mkdir()
+    (heartbeat_dir / "latest_status.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "timestamp": "2026-09-24T14:10:00+00:00",
+                "run_id": "monitor_20260924_141000",
+                "status": "MONITOR_OK",
+                "positions_checked": 4,
+                "positions_failed": 0,
+                "event_count": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "AGENT_RESULTS_DIR", tmp_path)
+    dashboard = {
+        "status": "ok",
+        "latest_run": {},
+        "system_health": {
+            "latest_monitor_at": "2026-09-24T14:00:00+00:00",
+            "latest_monitor_status": "",
+        },
+    }
+
+    enriched = main.enrich_agent_dashboard_snapshot(dashboard)
+
+    assert enriched["system_health"]["latest_monitor_status"] == "MONITOR_OK"
+    assert enriched["system_health"]["latest_monitor_positions_checked"] == 4
+    assert enriched["system_health"]["latest_monitor_event_count"] == 1
