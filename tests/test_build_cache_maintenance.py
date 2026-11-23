@@ -184,6 +184,25 @@ def test_unknown_service_state_prevents_prune(monkeypatch):
     assert maintenance.busy_reason() == "market-lens-scanner.service activity could not be confirmed"
 
 
+def test_dead_failed_service_does_not_permanently_block_storage_recovery(monkeypatch, tmp_path):
+    def run(args, **kwargs):
+        if 'is-active' in args:
+            return SimpleNamespace(stdout='failed\n',returncode=3)
+        return SimpleNamespace(stdout='0\n',returncode=0)
+    monkeypatch.setattr(maintenance.subprocess,'run',run)
+    # No real /proc or Docker access is required for this service-state proof.
+    original = maintenance.Path
+    monkeypatch.setattr(maintenance,'Path',lambda p: tmp_path if p=='/proc' else original(p))
+    assert maintenance.busy_reason() is None
+
+
+def test_failed_service_with_live_pid_still_blocks_storage_recovery(monkeypatch):
+    def run(args, **kwargs):
+        return SimpleNamespace(stdout='failed\n' if 'is-active' in args else '123\n',returncode=0)
+    monkeypatch.setattr(maintenance.subprocess,'run',run)
+    assert 'could not be confirmed' in maintenance.busy_reason()
+
+
 def test_weekly_timer_is_bounded_and_does_not_touch_trade_timers():
     deploy = Path(__file__).resolve().parents[1] / "deploy/hetzner"
     timer = (deploy / "market-lens-build-cache.timer").read_text()

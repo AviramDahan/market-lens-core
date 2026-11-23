@@ -60,6 +60,12 @@ def busy_reason() -> str | None:
         )
         if result.stdout.strip() in {"active", "activating", "reloading"}:
             return f"{unit} is running"
+        if result.stdout.strip() == "failed":
+            # A dead failed unit must not permanently block disk recovery.
+            pid = subprocess.run(["systemctl", "show", unit, "--property=MainPID", "--value"],
+                                 capture_output=True, text=True, timeout=10)
+            if getattr(pid, "returncode", 1) == 0 and pid.stdout.strip() == "0":
+                continue
         if result.stdout.strip() != "inactive":
             return f"{unit} activity could not be confirmed"
     # The builder is shared with AI Trader. Never prune while either app builds.
@@ -130,6 +136,21 @@ def maintenance_once() -> dict:
         result["cold_backups"] = archive_once()
         result["free_bytes_after"] = free_bytes()
     result["capacity_target_met"] = result["free_bytes_after"] >= TRIGGER_FREE_GB * 1024**3
+    if not busy and env_value("MARKET_LENS_IMAGE_RETENTION_ENABLED").lower() == "true":
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from deploy.hetzner.image_retention import retention_once
+        result["image_retention"] = retention_once()
+        if result["image_retention"].get("removed"):
+            result["free_bytes_after"] = free_bytes()
+            result["capacity_target_met"] = result["free_bytes_after"] >= TRIGGER_FREE_GB * 1024**3
+    if (not busy and not result["capacity_target_met"]
+            and env_value("MARKET_LENS_CLOSED_STAGE_ARCHIVE_ENABLED").lower() == "true"):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from deploy.hetzner.closed_stage_archives import archive_once as archive_stages
+        result["closed_stages"] = archive_stages()
+        if result["closed_stages"].get("archived_bytes", 0):
+            result["free_bytes_after"] = free_bytes()
+            result["capacity_target_met"] = result["free_bytes_after"] >= TRIGGER_FREE_GB * 1024**3
     cold_policy_held = (
         result["free_bytes_after"] >= PRESSURE_FREE_GB * 1024**3
         and (result.get("cold_backups") or {}).get("status") in {
